@@ -2275,7 +2275,8 @@ function normalize(raw: unknown): ImageSettings {
   const imageBackend = storedBackend === 'vertex' ? 'nai' : storedBackend;
   merged.defaultBackend = imageBackend === 'comfyui' || imageBackend === 'nai' ? imageBackend : d.defaultBackend;
   const vertex = normalizeVertexConnection(r.vertex, DEFAULT_VERTEX_TEXT);
-  if (/^(?:imagen-|gemini-.*(?:image|banana))/i.test(vertex.model.trim())) {
+  const legacyVertex = r.vertex && typeof r.vertex === 'object' && !('maxTokens' in r.vertex);
+  if (legacyVertex && /^(?:imagen-|gemini-.*(?:image|banana))/i.test(vertex.model.trim())) {
     vertex.model = DEFAULT_VERTEX_TEXT.model;
   }
   merged.vertex = {

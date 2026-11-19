@@ -2,11 +2,17 @@
 import { ref } from 'vue';
 import { settings } from '@/state/settings';
 import { requestVertexCompletion } from '@/api/vertexCompletion';
-import { describeFlexTraffic, vertexFlexError } from '@/api/vertex';
+import { describeFlexTraffic, VERTEX_MODELS, vertexFlexError } from '@/api/vertex';
 import VertexCredentials from '@/components/VertexCredentials.vue';
 
 const testing = ref(false);
 const result = ref('');
+
+function chooseModel(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  if (select.value) settings.vertex.model = select.value;
+  select.value = '';
+}
 
 async function test() {
   testing.value = true;
@@ -28,19 +34,24 @@ async function test() {
 
 <template>
   <div class="vertex-settings">
-    <VertexCredentials />
-    <label>
-      <span>Google Cloud 项目 ID</span>
-      <input v-model.trim="settings.vertex.project" class="bbi-input" placeholder="留空使用凭证中的项目" />
-    </label>
+    <VertexCredentials class="vertex-credentials" />
     <label>
       <span>地区</span>
       <input v-model.trim="settings.vertex.location" class="bbi-input" placeholder="global" />
     </label>
-    <label>
-      <span>Gemini 文字模型 ID</span>
-      <input v-model.trim="settings.vertex.model" class="bbi-input" placeholder="gemini-3.5-flash" />
-    </label>
+    <div class="vertex-model">
+      <label>
+        <span>模型</span>
+        <input v-model.trim="settings.vertex.model" class="bbi-input" placeholder="输入模型 ID"
+          spellcheck="false" autocomplete="off" autocapitalize="off" />
+      </label>
+      <select class="bbi-select" aria-label="从官方模型列表选择" @change="chooseModel">
+        <option value="" disabled selected>从官方模型列表选择</option>
+        <option v-for="model in VERTEX_MODELS" :key="model.id" :value="model.id">
+          {{ model.id }}{{ model.flex ? ' · Flex' : '' }}
+        </option>
+      </select>
+    </div>
     <label>
       <span>最大输出 token</span>
       <input v-model.number="settings.vertex.maxTokens" class="bbi-input" type="number" min="1" />
@@ -63,11 +74,16 @@ async function test() {
 </template>
 
 <style scoped>
-.vertex-settings, .vertex-settings label {
+.vertex-settings, .vertex-settings label, .vertex-model {
   display: grid;
   gap: 0.55rem;
   min-width: 0;
 }
+.vertex-model > select {
+  min-width: 0;
+  width: 100%;
+}
+.vertex-credentials { grid-column: 1 / -1; }
 .vertex-settings .vertex-flex { display: flex; align-items: center; }
 @media (min-width: 640px) {
   .vertex-settings { grid-template-columns: 1fr 1fr; }

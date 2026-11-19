@@ -7,7 +7,6 @@ export interface VertexTextSettings extends VertexConnection {
 }
 
 export const DEFAULT_VERTEX_TEXT: VertexTextSettings = {
-  project: '',
   location: 'global',
   model: 'gemini-3.5-flash',
   flex: false,

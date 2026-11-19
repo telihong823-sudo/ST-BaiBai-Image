@@ -2,7 +2,6 @@ import { computed, shallowRef } from 'vue';
 import { getContext } from '@/st/context';
 
 export interface VertexConnection {
-  project: string;
   location: string;
   model: string;
   flex: boolean;
@@ -19,20 +18,28 @@ interface ServiceAccount {
 const tokenUrl = 'https://oauth2.googleapis.com/token';
 const tauriSecretKey = 'vertexai_service_account_json';
 const tauriSecretLabel = '柏宝绘 · Vertex AI';
-// Google 官方列出的 global Flex PayGo 模型。
-const flexModels = new Set([
-  'gemini-3.8-flash-cyber', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash',
-  'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite',
-  'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
-  'gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image', 'gemini-3-pro-image',
-]);
+// 文字 GenerateContent 候选。新增或项目专用的模型可以直接输入。
+// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/google-models
+// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/flex-paygo
+export const VERTEX_MODELS = [
+  { id: 'gemini-4-neon', flex: false },
+  { id: 'gemini-4-hydrogen', flex: false },
+  { id: 'gemini-4-carbon', flex: false },
+  { id: 'gemini-4-argon', flex: false },
+  { id: 'gemini-3.8-flash', flex: true },
+  { id: 'gemini-3.7-flash', flex: true },
+  { id: 'gemini-3.5-flash', flex: true },
+  { id: 'gemini-3.5-flash-lite', flex: true },
+  { id: 'gemini-3.1-flash-lite', flex: true },
+  { id: 'gemini-3.1-pro-preview', flex: true },
+];
 const storeName = 'credentials';
 const recordId = 'vertex';
 const account = shallowRef<ServiceAccount>();
 const tokens = new WeakMap<ServiceAccount, { value: string; expiresAt: number }>();
 let loading: Promise<void> | undefined;
 
-export const vertexCredentialProject = computed(() => account.value?.project ?? '');
+export const hasVertexCredential = computed(() => Boolean(account.value));
 
 function isTauriTavern(): boolean {
   return Boolean((globalThis as typeof globalThis & { __TAURITAVERN__?: unknown }).__TAURITAVERN__);
@@ -98,19 +105,19 @@ export function loadVertexCredential(): Promise<void> {
     });
 }
 
-export async function importVertexCredential(file: File): Promise<void> {
+export async function importVertexCredential(text: string): Promise<void> {
   let data: Record<string, unknown>;
   try {
-    data = JSON.parse(await file.text());
+    data = JSON.parse(text.trim());
   } catch {
-    throw new Error('文件内容不是有效的 JSON');
+    throw new Error('凭证内容不是有效的 JSON');
   }
 
   if (data?.type !== 'service_account'
     || typeof data.project_id !== 'string' || !data.project_id.trim()
     || typeof data.client_email !== 'string' || !data.client_email.trim()
     || typeof data.private_key !== 'string' || !data.private_key.includes('-----BEGIN PRIVATE KEY-----')) {
-    throw new Error('请选择 Google Cloud 导出的服务账号 JSON 密钥');
+    throw new Error('请使用 Google Cloud 导出的服务账号 JSON 密钥');
   }
   if (!globalThis.crypto?.subtle) throw new Error('当前页面不支持 Web Crypto，无法导入凭证');
 
@@ -182,7 +189,6 @@ export function normalizeVertexConnection(
   defaults: VertexConnection,
 ): VertexConnection {
   return {
-    project: typeof value?.project === 'string' ? value.project : defaults.project,
     location: typeof value?.location === 'string' ? value.location : defaults.location,
     model: typeof value?.model === 'string' ? value.model : defaults.model,
     flex: value?.flex === true,
@@ -198,11 +204,8 @@ export function vertexTimeoutSec(flex: boolean, requested?: number): number {
 export function vertexFlexError(config: VertexConnection): string {
   if (!config.flex) return '';
   if ((config.location.trim() || 'global') !== 'global') return 'Flex PayGo 需要使用 global 地区';
-  const override = config.project.trim();
-  if (override && vertexCredentialProject.value && override !== vertexCredentialProject.value) {
-    return 'Flex 使用凭证中的项目 ID，请清空项目覆盖或导入该项目的凭证';
-  }
-  return flexModels.has(config.model.trim()) ? '' : '当前模型不在 Google 的 Flex PayGo 支持列表中';
+  const model = VERTEX_MODELS.find(({ id }) => id === config.model.trim());
+  return model?.flex === false ? '此模型请关闭 Flex 后使用' : '';
 }
 
 export function describeFlexTraffic(traffic?: string): string {
@@ -292,7 +295,7 @@ export async function vertexRequest<T>(
       ?? { parts: [{ text: typeof message?.content === 'string' ? message.content : '' }] };
     return { candidates: [{ content }], usageMetadata: completion.usageMetadata } as T;
   }
-  const project = encodeURIComponent(config.project.trim() || serviceAccount.project);
+  const project = encodeURIComponent(serviceAccount.project);
   const host = location === 'global' ? 'aiplatform.googleapis.com' : location + '-aiplatform.googleapis.com';
   const url = 'https://' + host + '/v1/projects/' + project + '/locations/' + location
     + '/publishers/google/models/' + encodeURIComponent(model) + ':generateContent';
