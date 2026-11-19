@@ -4,19 +4,26 @@ import {
   clearVertexCredential, hasVertexCredential, importVertexCredential, loadVertexCredential,
 } from '@/api/vertex';
 
+const props = defineProps<{ channelId: string }>();
+const emit = defineEmits<{ (event: 'busy-change', value: boolean): void }>();
 const busy = ref(false);
 const message = ref('');
 const pastedCredential = ref('');
 
-async function updateCredential(operation: () => Promise<void>) {
+async function updateCredential(operation: () => Promise<void>): Promise<boolean> {
+  if (busy.value) return false;
   busy.value = true;
+  emit('busy-change', true);
   message.value = '';
   try {
     await operation();
+    return true;
   } catch (error) {
     message.value = error instanceof Error ? error.message : '无法操作 Vertex AI 凭证';
+    return false;
   } finally {
     busy.value = false;
+    emit('busy-change', false);
   }
 }
 
@@ -29,7 +36,7 @@ function onFileChange(event: Event) {
       const text = await file.text().catch(() => {
         throw new Error('无法读取凭证文件，可以粘贴 JSON 内容');
       });
-      await importVertexCredential(text);
+      await importVertexCredential(props.channelId, text);
       pastedCredential.value = '';
     } finally {
       input.value = '';
@@ -37,14 +44,16 @@ function onFileChange(event: Event) {
   });
 }
 
-function savePastedCredential() {
-  void updateCredential(async () => {
-    await importVertexCredential(pastedCredential.value);
+async function savePending() {
+  if (!pastedCredential.value.trim()) return true;
+  return updateCredential(async () => {
+    await importVertexCredential(props.channelId, pastedCredential.value);
     pastedCredential.value = '';
   });
 }
 
-onMounted(() => updateCredential(loadVertexCredential));
+defineExpose({ savePending });
+onMounted(() => updateCredential(() => loadVertexCredential(props.channelId)));
 </script>
 
 <template>
@@ -68,11 +77,11 @@ onMounted(() => updateCredential(loadVertexCredential));
     </label>
     <div class="vertex-credential-status">
       <button class="bbi-btn" type="button" :disabled="busy || !pastedCredential.trim()"
-        @click="savePastedCredential">保存凭证</button>
-      <button v-if="hasVertexCredential" class="bbi-btn" type="button" :disabled="busy"
-        @click="updateCredential(clearVertexCredential)">清除凭证</button>
+        @click="savePending">保存凭证</button>
+      <button v-if="hasVertexCredential(channelId)" class="bbi-btn" type="button" :disabled="busy"
+        @click="updateCredential(() => clearVertexCredential(channelId))">清除凭证</button>
     </div>
-    <span role="status">{{ message || (hasVertexCredential ? '已保存凭证' : '') }}</span>
+    <span role="status">{{ message || (hasVertexCredential(channelId) ? '已保存凭证' : '') }}</span>
   </div>
 </template>
 

@@ -18,7 +18,7 @@ import {
   vibeMetaFromData,
 } from '@/backends/vibeStore';
 import { getContext } from '@/st/context';
-import { normalizeVertexConnection } from '@/api/vertex';
+import { LEGACY_VERTEX_CHANNEL_ID, normalizeVertexConnection } from '@/api/vertex';
 import { DEFAULT_VERTEX_TEXT, type VertexTextSettings } from '@/api/vertexCompletion';
 import { reactive, watch } from 'vue';
 
@@ -1140,7 +1140,7 @@ export interface ImageSettings {
   ui: UiPrefs;
   /** 渠道页初始展示的后端(无设置项,固定默认值) */
   defaultBackend: BackendId;
-  vertex: VertexTextSettings;
+  vertexChannels: VertexTagChannel[];
   /** 后端连接配置 */
   webui: BackendConn;
   comfyui: ComfyUISettings;
@@ -1454,7 +1454,7 @@ function defaults(): ImageSettings {
     },
     // 出图后端默认 ComfyUI(当前唯一实现的出图后端);webui 渠道已隐藏,不再作为可选值
     defaultBackend: 'comfyui',
-    vertex: { ...DEFAULT_VERTEX_TEXT },
+    vertexChannels: [],
     webui: backendDefaults('http://127.0.0.1:7860'),
     comfyui: comfyDefaults(),
     nai: naiDefaults(),
@@ -1524,17 +1524,32 @@ export function newChannel(): ApiChannel {
   };
 }
 
-export const VERTEX_TAG_CHANNEL_ID = 'bbi-vertex-ai';
-export type VertexTagChannel = VertexTextSettings & { provider: 'vertex'; name: string };
+export type VertexTagChannel = VertexTextSettings & { id: string; provider: 'vertex'; name: string };
+export type TagGenChannel = ApiChannel | VertexTagChannel;
+
+export function newVertexChannel(): VertexTagChannel {
+  return { ...DEFAULT_VERTEX_TEXT, id: 'vertex-' + newChannel().id, provider: 'vertex', name: 'Vertex AI' };
+}
+
+function normalizeVertexChannel(raw: Partial<VertexTagChannel>): VertexTagChannel {
+  const { id, name, maxTokens, timeoutSec } = raw;
+  return {
+    ...normalizeVertexConnection(raw, DEFAULT_VERTEX_TEXT),
+    id: typeof id === 'string' && id ? id : newVertexChannel().id,
+    provider: 'vertex',
+    name: typeof name === 'string' ? name : 'Vertex AI',
+    maxTokens: typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens >= 1
+      ? Math.floor(maxTokens) : DEFAULT_VERTEX_TEXT.maxTokens,
+    timeoutSec: typeof timeoutSec === 'number' && Number.isFinite(timeoutSec) && timeoutSec >= 1
+      ? Math.floor(timeoutSec) : DEFAULT_VERTEX_TEXT.timeoutSec,
+  };
+}
 
 /** 「生成 tag」当前指派的渠道;未指派(跟随主 API)或渠道已删时返回 null。 */
-export function getTagGenChannel(): ApiChannel | VertexTagChannel | null {
+export function getTagGenChannel(): TagGenChannel | null {
   const id = settings.assignments.tagGen;
   if (!id) return null;
-  if (id === VERTEX_TAG_CHANNEL_ID) {
-    return { ...settings.vertex, provider: 'vertex', name: 'Vertex AI' };
-  }
-  return settings.channels.find(c => c.id === id) ?? null;
+  return settings.vertexChannels.find(c => c.id === id) ?? settings.channels.find(c => c.id === id) ?? null;
 }
 
 /**
@@ -2239,8 +2254,9 @@ function normalizeExcludes(raw: unknown): ExcludesSettings {
 function normalize(raw: unknown): ImageSettings {
   if (!raw || typeof raw !== 'object') return defaults();
   const d = defaults();
-  const r = raw as Partial<ImageSettings>;
+  const r = raw as Partial<ImageSettings> & { vertex?: VertexTextSettings };
   const merged: ImageSettings = { ...d, ...r };
+  Reflect.deleteProperty(merged, 'vertex');
   // ui 是嵌套对象,展开合并不会补全缺字段,逐字段兜底
   const ru = (r.ui ?? {}) as Partial<UiPrefs>;
   merged.ui = {
@@ -2274,18 +2290,19 @@ function normalize(raw: unknown): ImageSettings {
   const storedBackend: unknown = r.defaultBackend;
   const imageBackend = storedBackend === 'vertex' ? 'nai' : storedBackend;
   merged.defaultBackend = imageBackend === 'comfyui' || imageBackend === 'nai' ? imageBackend : d.defaultBackend;
-  const vertex = normalizeVertexConnection(r.vertex, DEFAULT_VERTEX_TEXT);
-  const legacyVertex = r.vertex && typeof r.vertex === 'object' && !('maxTokens' in r.vertex);
-  if (legacyVertex && /^(?:imagen-|gemini-.*(?:image|banana))/i.test(vertex.model.trim())) {
-    vertex.model = DEFAULT_VERTEX_TEXT.model;
+  if (Array.isArray(r.vertexChannels)) {
+    merged.vertexChannels = r.vertexChannels
+      .filter(channel => channel && typeof channel === 'object')
+      .map(normalizeVertexChannel);
+  } else if (r.vertex && typeof r.vertex === 'object') {
+    const channel = normalizeVertexChannel({ ...r.vertex, id: LEGACY_VERTEX_CHANNEL_ID });
+    if (!('maxTokens' in r.vertex) && /^(?:imagen-|gemini-.*(?:image|banana))/i.test(channel.model.trim())) {
+      channel.model = DEFAULT_VERTEX_TEXT.model;
+    }
+    merged.vertexChannels = [channel];
+  } else {
+    merged.vertexChannels = [];
   }
-  merged.vertex = {
-    ...vertex,
-    maxTokens: typeof r.vertex?.maxTokens === 'number' && Number.isFinite(r.vertex.maxTokens) && r.vertex.maxTokens >= 1
-      ? Math.floor(r.vertex.maxTokens) : DEFAULT_VERTEX_TEXT.maxTokens,
-    timeoutSec: typeof r.vertex?.timeoutSec === 'number' && Number.isFinite(r.vertex.timeoutSec) && r.vertex.timeoutSec >= 1
-      ? Math.floor(r.vertex.timeoutSec) : DEFAULT_VERTEX_TEXT.timeoutSec,
-  };
   merged.webui = normalizeBackend(r.webui, d.webui);
   merged.comfyui = normalizeComfyUI(r.comfyui, d.comfyui, (() => {
     // 迁移来源:设置页旧的全局 ComfyUI 规范/思维链(更老的版本只有单份 thinking,同 prompts 段的口径)
@@ -2375,7 +2392,7 @@ function applyInto(target: ImageSettings, src: ImageSettings): void {
   target.enabled = src.enabled;
   target.ui = src.ui;
   target.defaultBackend = src.defaultBackend;
-  target.vertex = src.vertex;
+  target.vertexChannels = src.vertexChannels;
   target.webui = src.webui;
   target.comfyui = src.comfyui;
   target.nai = src.nai;
@@ -2449,9 +2466,7 @@ function applySharedChannels(store: SharedChannelsStore): void {
   settings.channels = store.channels;
   sharedChannelsFingerprint = fingerprint;
 
-  // Vertex AI 单独配置，不在共享渠道列表内。
-  const ids = new Set(settings.channels.map(channel => channel.id));
-  ids.add(VERTEX_TAG_CHANNEL_ID);
+  const ids = new Set([...settings.channels, ...settings.vertexChannels].map(channel => channel.id));
   if (settings.assignments.tagGen && !ids.has(settings.assignments.tagGen)) {
     settings.assignments.tagGen = '';
   }

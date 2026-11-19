@@ -5,8 +5,9 @@ import Collapsible from '@/components/Collapsible.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
-import VertexSettings from './VertexSettings.vue';
+import VertexCredentials from '@/components/VertexCredentials.vue';
 import { fetchModels, testChannel } from '@/api/client';
+import { clearVertexCredential, hasVertexCredential, VERTEX_MODELS } from '@/api/vertex';
 import {
   BACKENDS,
   DEFAULT_JAILBREAK_PROMPT,
@@ -14,13 +15,14 @@ import {
   DEFAULT_NAI_V5_THINKING,
   IMAGE_DISPLAY_SIZES,
   newChannel,
+  newVertexChannel,
   sanitizeTagName,
   settings,
-  VERTEX_TAG_CHANNEL_ID,
   type ApiChannel,
   type AutoTagPrompts,
   type BackendId,
   type ImageDisplaySize,
+  type TagGenChannel,
 } from '@/state/settings';
 import { getContext } from '@/st/context';
 import {
@@ -32,7 +34,7 @@ import {
   type ThemeName,
 } from '@/state/ui';
 import { checkForUpdate, performUpdate, updateState } from '@/update';
-import { computed, nextTick, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 
 const NAV_OPTIONS: { value: NavPosition; label: string }[] = [
   { value: 'auto', label: '自动' },
@@ -90,10 +92,10 @@ const tagGenSel = computed<string>({
   get: () => settings.assignments.tagGen,
   set: v => (settings.assignments.tagGen = v),
 });
+const allChannels = computed(() => [...settings.channels, ...settings.vertexChannels]);
 const TAG_GEN_OPTIONS = computed(() => [
   { value: '', label: '跟随主 API' },
-  { value: VERTEX_TAG_CHANNEL_ID, label: 'Vertex AI' },
-  ...settings.channels.map(c => ({ value: c.id, label: c.name || '未命名渠道' })),
+  ...allChannels.value.map(c => ({ value: c.id, label: c.name || '未命名渠道' })),
 ]);
 
 /* —— 渠道:列表只读展示,编辑/新建都在弹窗里进行,避免一长列表平铺误触。
@@ -102,11 +104,21 @@ const TAG_GEN_OPTIONS = computed(() => [
 const editingId = ref<string | null>(null);
 // 编辑用「草稿副本」:v-model 全改在草稿上,只有点「完成」才写回 settings(避免每敲一字就触发存盘)。
 // 弹窗开关也以它为准:草稿存在 = 弹窗打开。
-const editingChannel = ref<ApiChannel | null>(null);
-// 深拷贝渠道(纯数据,JSON 即可),切断与 settings 真身的引用
-function cloneChannel(ch: ApiChannel): ApiChannel {
-  return JSON.parse(JSON.stringify(ch)) as ApiChannel;
-}
+const editingChannel = ref<TagGenChannel | null>(null);
+const vertexDraft = computed(() => {
+  const channel = editingChannel.value;
+  return channel && 'provider' in channel ? channel : null;
+});
+const openAiDraft = computed(() => {
+  const channel = editingChannel.value;
+  return channel && !('provider' in channel) ? channel : null;
+});
+const vertexCredentials = ref<InstanceType<typeof VertexCredentials> | null>(null);
+const credentialBusy = ref(false);
+const editorBusy = ref(false);
+const channelBusy = computed(() => credentialBusy.value || editorBusy.value);
+let testController: AbortController | null = null;
+const testRunning = ref(false);
 // 密钥默认隐藏;每次打开/关闭弹窗都复位,避免密钥意外保持明文
 const showKey = ref(false);
 
@@ -212,9 +224,9 @@ function insertTagMacro(token: string) {
 
 // 排除参数:内部存 string[],编辑时用逗号分隔的单行文本承载,读/写两向转换。
 const excludeParamsText = computed<string>({
-  get: () => editingChannel.value?.excludeParams.join(', ') ?? '',
+  get: () => openAiDraft.value?.excludeParams.join(', ') ?? '',
   set: v => {
-    const ch = editingChannel.value;
+    const ch = openAiDraft.value;
     if (!ch) return;
     ch.excludeParams = v
       .split(',')
@@ -223,70 +235,120 @@ const excludeParamsText = computed<string>({
   },
 });
 
-function addChannel() {
+function addChannel(provider: 'openai' | 'vertex' = 'openai') {
   showKey.value = false;
   editingId.value = null; // null = 新建,完成时 push
-  editingChannel.value = newChannel(); // 草稿,尚未进 settings
+  editingChannel.value = provider === 'vertex' ? newVertexChannel() : newChannel();
 }
 function openChannel(id: string) {
-  const src = settings.channels.find(c => c.id === id);
+  const src = allChannels.value.find(c => c.id === id);
   if (!src) return;
   showKey.value = false;
   editingId.value = id;
-  editingChannel.value = cloneChannel(src); // 编辑草稿副本,不动真身
+  editingChannel.value = 'provider' in src ? { ...src } : { ...src, excludeParams: [...src.excludeParams] };
 }
-/** 取消(× / 点遮罩):丢弃草稿,不写回 settings(无论新建还是编辑,改动都作废)。 */
-function closeChannel() {
+function resetChannelEditor() {
+  testController?.abort();
+  modelMenuOpen.value = false;
+  modelQuery.value = '';
   showKey.value = false;
   editingId.value = null;
   editingChannel.value = null;
 }
-/** 完成:把草稿写回 settings —— 新建则 push,编辑则按 id 覆盖。此时才触发存盘。 */
-function confirmChannel() {
+
+async function closeChannel() {
+  if (channelBusy.value) return;
+  testController?.abort();
+  const draft = vertexDraft.value;
+  if (!editingId.value && draft && hasVertexCredential(draft.id)) {
+    editorBusy.value = true;
+    try {
+      await clearVertexCredential(draft.id);
+    } catch (error) {
+      testing.value[draft.id] = error instanceof Error ? error.message : String(error);
+      return;
+    } finally {
+      editorBusy.value = false;
+    }
+  }
+  resetChannelEditor();
+}
+
+onBeforeUnmount(() => {
+  testController?.abort();
+  if (!editingId.value && vertexDraft.value && hasVertexCredential(vertexDraft.value.id)) {
+    void clearVertexCredential(vertexDraft.value.id).catch(() => {});
+  }
+});
+
+async function confirmChannel() {
   const draft = editingChannel.value;
-  if (draft) {
+  if (!draft || channelBusy.value) return;
+  editorBusy.value = true;
+  try {
+    if ('provider' in draft && vertexCredentials.value && !await vertexCredentials.value.savePending()) return;
     draft.timeoutSec =
       Number.isFinite(draft.timeoutSec) && draft.timeoutSec > 0
         ? Math.floor(draft.timeoutSec)
-        : 180;
-    const list = settings.channels;
-    if (editingId.value) {
-      const idx = list.findIndex(c => c.id === editingId.value);
-      if (idx >= 0) list[idx] = draft;
-      else list.push(draft); // 编辑期间原渠道被删等异常 → 兜底为新增
+        : 'provider' in draft ? 0 : 180;
+    if ('provider' in draft) {
+      const idx = settings.vertexChannels.findIndex(c => c.id === editingId.value);
+      if (idx >= 0) settings.vertexChannels[idx] = draft;
+      else settings.vertexChannels.push(draft);
     } else {
-      list.push(draft);
+      const idx = settings.channels.findIndex(c => c.id === editingId.value);
+      if (idx >= 0) settings.channels[idx] = draft;
+      else settings.channels.push(draft);
     }
+    resetChannelEditor();
+  } finally {
+    editorBusy.value = false;
   }
-  showKey.value = false;
-  editingId.value = null;
-  editingChannel.value = null;
 }
 // 删除渠道前的二次确认:点删除先开确认弹窗,确认后才真正删。
 const confirmDeleteOpen = ref(false);
 function askRemoveChannel() {
   confirmDeleteOpen.value = true;
 }
-function confirmRemoveChannel() {
+async function confirmRemoveChannel() {
   confirmDeleteOpen.value = false;
-  // 删除针对「已有渠道」(editingId);新建草稿尚未入库,等同直接丢弃草稿
-  if (editingId.value) removeChannel(editingId.value);
-  editingId.value = null;
-  editingChannel.value = null;
-}
-function removeChannel(id: string) {
-  const list = settings.channels;
-  const idx = list.findIndex(c => c.id === id);
-  if (idx >= 0) list.splice(idx, 1);
-  // 清理指派:生成 tag 若指派了该渠道则清空(回落跟随主 API)
-  if (settings.assignments.tagGen === id) settings.assignments.tagGen = '';
+  if (channelBusy.value) return;
+  const id = editingId.value;
+  if (!id) return closeChannel();
+  testController?.abort();
+  const list = vertexDraft.value ? settings.vertexChannels : settings.channels;
+  editorBusy.value = true;
+  try {
+    if (vertexDraft.value) await clearVertexCredential(id);
+    const idx = list.findIndex(c => c.id === id);
+    if (idx >= 0) list.splice(idx, 1);
+    if (settings.assignments.tagGen === id) settings.assignments.tagGen = '';
+    resetChannelEditor();
+  } catch (error) {
+    testing.value[id] = error instanceof Error ? error.message : String(error);
+  } finally {
+    editorBusy.value = false;
+  }
 }
 
 const testing = ref<Record<string, string>>({});
-async function doTest(ch: ApiChannel) {
+async function doTest(ch: TagGenChannel) {
+  if (testRunning.value || channelBusy.value) return;
+  const controller = new AbortController();
+  testController = controller;
+  testRunning.value = true;
   testing.value[ch.id] = '测试中…';
-  const r = await testChannel(ch);
-  testing.value[ch.id] = r.message;
+  try {
+    if ('provider' in ch && vertexCredentials.value && !await vertexCredentials.value.savePending()) {
+      testing.value[ch.id] = '';
+      return;
+    }
+    const r = await testChannel(ch, controller.signal);
+    testing.value[ch.id] = controller.signal.aborted ? '' : r.message;
+  } finally {
+    testController = null;
+    testRunning.value = false;
+  }
 }
 
 // 各渠道拉取到的模型列表 + 拉取状态
@@ -443,6 +505,7 @@ const modelMenuOpen = ref(false);
 const modelQuery = ref(''); // 聚焦后用户输入的过滤词;失焦时清空
 // 已拉取到的当前渠道模型列表
 const modelList = computed<string[]>(() => {
+  if (vertexDraft.value) return VERTEX_MODELS.map(model => model.id);
   const id = editingChannel.value?.id;
   return id ? models.value[id] ?? [] : [];
 });
@@ -647,24 +710,25 @@ async function confirmUpdate() {
             <BbiSelect v-model="tagGenSel" :options="TAG_GEN_OPTIONS" aria-label="生成 tag 使用的 API 渠道" />
           </div>
         </div>
-        <p class="bbi-field-hint">选择用于写 tag 的文字模型。Vertex AI 在下方单独配置，其余副渠道与柏宝书共享。</p>
-
-        <Collapsible title="Vertex AI" :open="false">
-          <VertexSettings />
-        </Collapsible>
+        <p class="bbi-field-hint">选择用于写 tag 的文字模型。</p>
 
         <hr class="bbi-rule" />
 
         <!-- 渠道:顶部添加按钮 + 紧凑只读列表(点行进弹窗编辑),不再一长列表平铺 -->
         <div class="bbi-channel-bar">
           <span class="bbi-field-label">渠道</span>
-          <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addChannel()">
-            <Icon name="plus" /> 添加渠道
-          </button>
+          <div class="bbi-channel-actions">
+            <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addChannel()">
+              <Icon name="plus" /> 添加渠道
+            </button>
+            <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addChannel('vertex')">
+              <Icon name="plus" /> 添加 Vertex AI 渠道
+            </button>
+          </div>
         </div>
 
-        <ul v-if="settings.channels.length" class="bbi-channel-list">
-          <li v-for="ch in settings.channels" :key="ch.id" class="bbi-channel-item">
+        <ul v-if="allChannels.length" class="bbi-channel-list">
+          <li v-for="ch in allChannels" :key="ch.id" class="bbi-channel-item">
             <button class="bbi-channel-open" type="button" @click="openChannel(ch.id)">
               <span class="bbi-channel-item-name">{{ ch.name || '未命名渠道' }}</span>
               <span class="bbi-channel-item-model">{{ ch.model || '未设模型' }}</span>
@@ -945,22 +1009,29 @@ async function confirmUpdate() {
       <div v-if="editingChannel" class="bbi-modal" role="dialog" aria-modal="true" aria-label="编辑渠道">
         <header class="bbi-modal-head">
           <span class="bbi-modal-title">编辑渠道</span>
-          <button class="bbi-icon-mini" type="button" title="关闭" @click="closeChannel"><Icon name="close" /></button>
+          <button class="bbi-icon-mini" type="button" title="关闭" :disabled="channelBusy" @click="closeChannel"><Icon name="close" /></button>
         </header>
 
         <label class="bbi-modal-field">
           <span class="bbi-modal-label">渠道名</span>
           <input v-model="editingChannel.name" class="bbi-input" placeholder="渠道名" />
         </label>
-        <label class="bbi-modal-field">
+        <VertexCredentials
+          v-if="vertexDraft"
+          :key="vertexDraft.id"
+          ref="vertexCredentials"
+          :channel-id="vertexDraft.id"
+          @busy-change="credentialBusy = $event"
+        />
+        <label v-if="openAiDraft" class="bbi-modal-field">
           <span class="bbi-modal-label">API 地址</span>
-          <input v-model="editingChannel.url" class="bbi-input" placeholder="如 https://api.openai.com/v1" />
+          <input v-model="openAiDraft.url" class="bbi-input" placeholder="如 https://api.openai.com/v1" />
         </label>
-        <label class="bbi-modal-field">
+        <label v-if="openAiDraft" class="bbi-modal-field">
           <span class="bbi-modal-label">API 密钥</span>
           <div class="bbi-model-row">
             <input
-              v-model="editingChannel.key"
+              v-model="openAiDraft.key"
               class="bbi-input"
               :type="showKey ? 'text' : 'password'"
               placeholder="API 密钥"
@@ -985,6 +1056,7 @@ async function confirmUpdate() {
                 v-model="editingChannel.model"
                 class="bbi-input"
                 :placeholder="modelList.length ? '搜索或输入模型名…' : '模型名,如 gpt-4o-mini'"
+                :spellcheck="!vertexDraft"
                 @focus="openModelMenu"
                 @input="modelQuery = editingChannel.model; modelMenuOpen = true"
                 @blur="closeModelMenuSoon"
@@ -1008,43 +1080,60 @@ async function confirmUpdate() {
               class="bbi-icon-mini"
               type="button"
               :title="loadingModels[editingChannel.id] ? '拉取中…' : '拉取模型'"
+              v-if="openAiDraft"
               :disabled="loadingModels[editingChannel.id]"
-              @click="pullModels(editingChannel)"
+              @click="pullModels(openAiDraft)"
             >
               <Icon name="refresh" />
+            </button>
+            <button v-else class="bbi-icon-mini" type="button" title="选择模型" aria-label="选择模型"
+              :aria-expanded="modelMenuOpen" @mousedown.prevent @click="modelMenuOpen ? (modelMenuOpen = false) : openModelMenu()">
+              <Icon name="chevron" />
             </button>
           </div>
         </label>
         <div class="bbi-channel-row">
-          <label class="bbi-mini-field">
+          <label v-if="openAiDraft" class="bbi-mini-field">
             <span>温度</span>
-            <input v-model.number="editingChannel.temperature" class="bbi-input" type="number" step="0.1" min="0" max="2" />
+            <input v-model.number="openAiDraft.temperature" class="bbi-input" type="number" step="0.1" min="0" max="2" />
+          </label>
+          <label v-if="vertexDraft" class="bbi-mini-field">
+            <span>地区</span>
+            <input v-model.trim="vertexDraft.location" class="bbi-input" placeholder="global" />
           </label>
           <label class="bbi-mini-field">
             <span>最大 token</span>
-            <input v-model.number="editingChannel.maxTokens" class="bbi-input" type="number" step="256" min="256" />
+            <input v-model.number="editingChannel.maxTokens" class="bbi-input" type="number" step="256" :min="vertexDraft ? 1 : 256" />
           </label>
           <label class="bbi-mini-field">
             <span>超时(秒)</span>
-            <input v-model.number="editingChannel.timeoutSec" class="bbi-input" type="number" step="10" min="1" />
+            <input v-model.number="editingChannel.timeoutSec" class="bbi-input" type="number" step="10"
+              :min="vertexDraft ? 0 : 1" :max="vertexDraft?.flex ? 1800 : undefined" />
           </label>
           <!-- 思考强度用 BbiSelect(纯选择,不唤起输入法);它自带 180px 固定宽,
                这里要跟其余三个等分,故在 .bbi-mini-field 内用 :deep 放开宽度 -->
-          <div class="bbi-mini-field">
+          <div v-if="openAiDraft" class="bbi-mini-field">
             <span>思考强度</span>
             <BbiSelect
-              v-model="editingChannel.reasoningEffort"
+              v-model="openAiDraft.reasoningEffort"
               :options="REASONING_EFFORT_OPTIONS"
               aria-label="思考强度"
             />
           </div>
         </div>
-        <span class="bbi-field-hint">思考强度不知道的就选 auto，DS 系推荐 max</span>
-        <label class="bbi-switch-row">
+        <template v-if="vertexDraft">
+          <span class="bbi-field-hint">超时填 0 时，标准模式 180 秒，Flex 模式 600 秒。</span>
+          <label class="bbi-switch-row">
+            <span class="bbi-modal-label">Flex 模式（global）</span>
+            <input v-model="vertexDraft.flex" type="checkbox" class="bbi-checkbox" />
+          </label>
+        </template>
+        <span v-if="openAiDraft" class="bbi-field-hint">思考强度不知道的就选 auto，DS 系推荐 max</span>
+        <label v-if="openAiDraft" class="bbi-switch-row">
           <span class="bbi-modal-label">流式传输</span>
-          <input v-model="editingChannel.stream" type="checkbox" class="bbi-checkbox" />
+          <input v-model="openAiDraft.stream" type="checkbox" class="bbi-checkbox" />
         </label>
-        <label class="bbi-modal-field">
+        <label v-if="openAiDraft" class="bbi-modal-field">
           <span class="bbi-modal-label">排除参数</span>
           <input
             v-model="excludeParamsText"
@@ -1059,14 +1148,14 @@ async function confirmUpdate() {
         <footer class="bbi-modal-foot">
           <!-- 删除靠左、与右侧主操作拉开,破坏性动作不与「完成」相邻,降低误触。
                删除:始终显示文字;测试:PC 显「测试渠道」,移动端只显「测试」(短版,省版面) -->
-          <button class="bbi-btn bbi-btn-danger" type="button" @click="askRemoveChannel">
+          <button v-if="editingId" class="bbi-btn bbi-btn-danger" type="button" :disabled="channelBusy" @click="askRemoveChannel">
             <Icon name="trash" /> 删除
           </button>
           <span class="bbi-modal-foot-spacer"></span>
-          <button class="bbi-btn" type="button" title="测试渠道" @click="doTest(editingChannel)">
+          <button class="bbi-btn" type="button" title="测试渠道" :disabled="channelBusy || testRunning" @click="doTest(editingChannel)">
             <Icon name="plug" /> <span class="bbi-btn-label-full">测试渠道</span><span class="bbi-btn-label-short">测试</span>
           </button>
-          <button class="bbi-btn bbi-btn-primary" type="button" @click="confirmChannel">完成</button>
+          <button class="bbi-btn bbi-btn-primary" type="button" :disabled="channelBusy" @click="confirmChannel">完成</button>
         </footer>
 
         <!-- 删除渠道二次确认:叠在渠道弹窗之上。置于 v-if="editingChannel" 块内,
@@ -1286,6 +1375,13 @@ async function confirmUpdate() {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.bbi-channel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* 渠道:紧凑只读列表,每渠道一行,点行进弹窗编辑 */

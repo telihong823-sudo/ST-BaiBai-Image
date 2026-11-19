@@ -1,5 +1,6 @@
 import { getContext } from '@/st/context';
-import type { ApiChannel, VertexTagChannel } from '@/state/settings';
+import type { ApiChannel, TagGenChannel, VertexTagChannel } from '@/state/settings';
+import { describeFlexTraffic } from './vertex';
 import { requestVertexCompletion } from './vertexCompletion';
 import {
   beginLlm,
@@ -152,17 +153,18 @@ async function withTimeout<T>(
  * 发起一次补全请求,返回文本内容。
  */
 export async function requestCompletion(
-  channel: ApiChannel | VertexTagChannel,
+  channel: TagGenChannel,
   messages: ChatMsg[],
   opts: RequestOptions = {},
 ): Promise<string> {
   if ('provider' in channel) {
-    return trackCompletion(channel, false, messages, opts, async () => {
-      const { text } = await requestVertexCompletion(channel, messages, opts.signal);
-      return { content: text, usage: { prompt: null, completion: null } };
-    });
+    return (await requestVertexChannel(channel, messages, opts)).content;
   }
   return requestCompletionAtUrl(channel, messages, normalizeUrl(channel.url), opts);
+}
+
+function requestVertexChannel(channel: VertexTagChannel, messages: ChatMsg[], opts: RequestOptions) {
+  return trackCompletion(channel, false, messages, opts, () => requestVertexCompletion(channel, messages, opts.signal));
 }
 
 /**
@@ -261,7 +263,7 @@ async function requestCompletionAtUrl(
 
   const timeoutSec = validTimeoutSec(channel.timeoutSec);
 
-  return trackCompletion(channel, stream, messages, opts, () =>
+  const result = await trackCompletion(channel, stream, messages, opts, () =>
     withTimeout(timeoutSec, opts.signal, '副 API 请求', async signal => {
       const resp = await fetch(GENERATE_URL, {
         method: 'POST',
@@ -295,15 +297,16 @@ async function requestCompletionAtUrl(
       return { content: parsed, usage: readUsage(data) };
     }),
   );
+  return result.content;
 }
 
-async function trackCompletion(
+async function trackCompletion<T extends { content: string; usage: ReturnType<typeof readUsage> }>(
   channel: Pick<ApiChannel, 'name' | 'model'>,
   stream: boolean,
   messages: ChatMsg[],
   opts: RequestOptions,
-  send: () => Promise<{ content: string; usage: ReturnType<typeof readUsage> }>,
-): Promise<string> {
+  send: () => Promise<T>,
+): Promise<T> {
   // 请求发出前登记，失败和超时也进历史。
   const historyId = safeHistory(() =>
     beginLlm({
@@ -332,7 +335,7 @@ async function trackCompletion(
       // 没有上游 token 数据时异步估算。
       if (!hasReal) void estimateTokens(historyId, messages, result.content);
     }
-    return result.content;
+    return result;
   } catch (e) {
     if (historyId !== null) {
       const aborted = e instanceof DOMException && e.name === 'AbortError';
@@ -489,14 +492,24 @@ export async function requestViaMainApi(messages: ChatMsg[], opts: RequestOption
 }
 
 /** 连通性测试:发一条极短请求 */
-export async function testChannel(channel: ApiChannel): Promise<{ ok: boolean; message: string }> {
+export async function testChannel(channel: TagGenChannel, signal?: AbortSignal): Promise<{ ok: boolean; message: string }> {
+  const messages: ChatMsg[] = [{ role: 'user', content: '回复"ok"两个字符即可。' }];
+  if ('provider' in channel) {
+    try {
+      const reply = await requestVertexChannel(channel, messages, { source: '连通性测试', signal });
+      const tier = channel.flex ? ' · ' + describeFlexTraffic(reply.trafficType) : '';
+      return { ok: true, message: '连通正常 · ' + reply.content.slice(0, 40) + tier };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const primaryUrl = normalizeUrl(channel.url);
   try {
     const reply = await requestCompletionAtUrl(
       channel,
-      [{ role: 'user', content: '回复"ok"两个字符即可。' }],
+      messages,
       primaryUrl,
-      { source: '连通性测试' },
+      { source: '连通性测试', signal },
     );
     const changed = channel.url.trim().replace(/\/+$/, '') !== primaryUrl;
     if (changed) channel.url = primaryUrl;
@@ -516,9 +529,9 @@ export async function testChannel(channel: ApiChannel): Promise<{ ok: boolean; m
     try {
       const reply = await requestCompletionAtUrl(
         channel,
-        [{ role: 'user', content: '回复"ok"两个字符即可。' }],
+        messages,
         fallbackUrl,
-        { source: '连通性测试(备用地址)' },
+        { source: '连通性测试(备用地址)', signal },
       );
       channel.url = fallbackUrl;
       return {

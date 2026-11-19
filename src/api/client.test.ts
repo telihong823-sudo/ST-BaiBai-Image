@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { BACKENDS, getTagGenChannel, settings, VERTEX_TAG_CHANNEL_ID, type ApiChannel } from '@/state/settings';
-import { buildRequestBody, extractContent, readSseContent, requestCompletion } from './client';
+import { BACKENDS, getTagGenChannel, newVertexChannel, settings, type ApiChannel } from '@/state/settings';
+import { buildRequestBody, extractContent, readSseContent, requestCompletion, testChannel } from './client';
 import * as vertex from './vertex';
 
 /** 历史层全部 mock 掉:这里要断的正是「什么时候记成功/失败」 */
@@ -262,28 +262,25 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
     const previous = {
       tagGen: settings.assignments.tagGen,
       backend: settings.defaultBackend,
-      flex: settings.vertex.flex,
+      channels: settings.vertexChannels,
     };
     const output = '{"images":[{"prompt":"blue eyes"}]}';
     const send = vi.spyOn(vertex, 'vertexRequest').mockResolvedValue({
       candidates: [{ content: { parts: [{ text: output }] } }],
     });
     try {
-      settings.assignments.tagGen = VERTEX_TAG_CHANNEL_ID;
+      const preset = { ...newVertexChannel(), flex: true };
+      settings.vertexChannels = [preset];
+      settings.assignments.tagGen = preset.id;
       settings.defaultBackend = 'nai';
-      settings.vertex.flex = true;
       const tagChannel = getTagGenChannel();
       expect(tagChannel).not.toBeNull();
       const validate = vi.fn();
       await expect(requestCompletion(tagChannel!, messages, { validate })).resolves.toBe(output);
       expect(send).toHaveBeenCalledWith(
-        expect.objectContaining({ model: 'gemini-3.5-flash', flex: true }),
-        {
-          contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
-          generationConfig: { maxOutputTokens: 16384 },
-        },
-        expect.any(AbortSignal),
-        600,
+        expect.objectContaining({ id: preset.id, model: 'gemini-3.5-flash', flex: true }),
+        messages,
+        { maxTokens: 16384, signal: expect.any(AbortSignal), timeoutSec: 600 },
       );
       expect(validate).toHaveBeenCalledWith(output);
       expect(h.finishLlm).toHaveBeenCalledTimes(1);
@@ -293,7 +290,30 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
       send.mockRestore();
       settings.assignments.tagGen = previous.tagGen;
       settings.defaultBackend = previous.backend;
-      settings.vertex.flex = previous.flex;
+      settings.vertexChannels = previous.channels;
+    }
+  });
+
+  it('Vertex 测试渠道的成功和失败均写入请求历史', async () => {
+    const preset = { ...newVertexChannel(), name: 'Vertex 测试' };
+    const send = vi.spyOn(vertex, 'vertexRequest')
+      .mockResolvedValueOnce({
+        candidates: [{ content: { parts: [{ text: 'OK' }] } }],
+        usageMetadata: { promptTokenCount: 8, candidatesTokenCount: 2 },
+      })
+      .mockRejectedValueOnce(new Error('连接失败'));
+    try {
+      await expect(testChannel(preset)).resolves.toMatchObject({ ok: true });
+      expect(h.beginLlm).toHaveBeenCalledWith(expect.objectContaining({
+        source: '连通性测试', channelName: preset.name, model: preset.model,
+      }));
+      expect(h.finishLlm).toHaveBeenCalledWith(1, expect.objectContaining({
+        response: 'OK', promptTokens: 8, completionTokens: 2,
+      }));
+      await expect(testChannel(preset)).resolves.toEqual({ ok: false, message: '连接失败' });
+      expect(h.failLlm).toHaveBeenCalledWith(1, '连接失败', false);
+    } finally {
+      send.mockRestore();
     }
   });
 
