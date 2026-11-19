@@ -5,6 +5,7 @@ import Collapsible from '@/components/Collapsible.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
+import VertexSettings from './VertexSettings.vue';
 import { fetchModels, testChannel } from '@/api/client';
 import {
   BACKENDS,
@@ -15,6 +16,7 @@ import {
   newChannel,
   sanitizeTagName,
   settings,
+  VERTEX_TAG_CHANNEL_ID,
   type ApiChannel,
   type AutoTagPrompts,
   type BackendId,
@@ -90,6 +92,7 @@ const tagGenSel = computed<string>({
 });
 const TAG_GEN_OPTIONS = computed(() => [
   { value: '', label: '跟随主 API' },
+  { value: VERTEX_TAG_CHANNEL_ID, label: 'Vertex AI' },
   ...settings.channels.map(c => ({ value: c.id, label: c.name || '未命名渠道' })),
 ]);
 
@@ -644,7 +647,11 @@ async function confirmUpdate() {
             <BbiSelect v-model="tagGenSel" :options="TAG_GEN_OPTIONS" aria-label="生成 tag 使用的 API 渠道" />
           </div>
         </div>
-        <p class="bbi-field-hint">不指派渠道时跟随主 API:直接借用你主界面当前正在用的 API(聊天补全/文本补全)来生成画图 tag,无需额外配置。想用不同模型再在下方建副渠道指派。渠道列表与柏宝书共享,任一端改动都会自动同步到另一端。</p>
+        <p class="bbi-field-hint">选择用于写 tag 的文字模型。Vertex AI 在下方单独配置，其余副渠道与柏宝书共享。</p>
+
+        <Collapsible title="Vertex AI" :open="false">
+          <VertexSettings />
+        </Collapsible>
 
         <hr class="bbi-rule" />
 

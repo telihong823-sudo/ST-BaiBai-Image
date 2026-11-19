@@ -1,5 +1,6 @@
 import { getContext } from '@/st/context';
-import type { ApiChannel } from '@/state/settings';
+import type { ApiChannel, VertexTagChannel } from '@/state/settings';
+import { requestVertexCompletion } from './vertexCompletion';
 import {
   beginLlm,
   failLlm,
@@ -151,10 +152,16 @@ async function withTimeout<T>(
  * 发起一次补全请求,返回文本内容。
  */
 export async function requestCompletion(
-  channel: ApiChannel,
+  channel: ApiChannel | VertexTagChannel,
   messages: ChatMsg[],
   opts: RequestOptions = {},
 ): Promise<string> {
+  if ('provider' in channel) {
+    return trackCompletion(channel, false, messages, opts, async () => {
+      const { text } = await requestVertexCompletion(channel, messages, opts.signal);
+      return { content: text, usage: { prompt: null, completion: null } };
+    });
+  }
   return requestCompletionAtUrl(channel, messages, normalizeUrl(channel.url), opts);
 }
 
@@ -254,19 +261,8 @@ async function requestCompletionAtUrl(
 
   const timeoutSec = validTimeoutSec(channel.timeoutSec);
 
-  // 历史埋点:登记在真正发请求之前,失败/超时也留痕(排查时要看的往往正是失败那次)。
-  const historyId = safeHistory(() =>
-    beginLlm({
-      source: opts.source || '未标注',
-      channelName: channel.name || channel.model || '(未命名渠道)',
-      model: channel.model,
-      stream,
-      messages,
-    }),
-  );
-
-  try {
-    const result = await withTimeout(timeoutSec, opts.signal, '副 API 请求', async signal => {
+  return trackCompletion(channel, stream, messages, opts, () =>
+    withTimeout(timeoutSec, opts.signal, '副 API 请求', async signal => {
       const resp = await fetch(GENERATE_URL, {
         method: 'POST',
         headers: ctx.getRequestHeaders(),
@@ -297,8 +293,29 @@ async function requestCompletionAtUrl(
       if (!parsed) throw new ApiError('副 API 返回空内容');
       // ST 代理非流式分支是 response.send(json) 原样透传,故 usage 是上游真值。
       return { content: parsed, usage: readUsage(data) };
-    });
+    }),
+  );
+}
 
+async function trackCompletion(
+  channel: Pick<ApiChannel, 'name' | 'model'>,
+  stream: boolean,
+  messages: ChatMsg[],
+  opts: RequestOptions,
+  send: () => Promise<{ content: string; usage: ReturnType<typeof readUsage> }>,
+): Promise<string> {
+  // 请求发出前登记，失败和超时也进历史。
+  const historyId = safeHistory(() =>
+    beginLlm({
+      source: opts.source || '未标注',
+      channelName: channel.name || channel.model || '(未命名渠道)',
+      model: channel.model,
+      stream,
+      messages,
+    }),
+  );
+  try {
+    const result = await send();
     // 验收在记历史之前:验收不过 → 落进 catch 记失败,不给「HTTP 成功」的假象
     opts.validate?.(result.content);
 
@@ -312,7 +329,7 @@ async function requestCompletionAtUrl(
           tokensEstimated: false,
         }),
       );
-      // 没有真值(流式)才估算。估算是异步的,不 await——不能让它拖慢主流程。
+      // 没有上游 token 数据时异步估算。
       if (!hasReal) void estimateTokens(historyId, messages, result.content);
     }
     return result.content;

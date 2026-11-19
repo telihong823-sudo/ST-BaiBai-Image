@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ApiChannel } from '@/state/settings';
+import { BACKENDS, getTagGenChannel, settings, VERTEX_TAG_CHANNEL_ID, type ApiChannel } from '@/state/settings';
 import { buildRequestBody, extractContent, readSseContent, requestCompletion } from './client';
+import * as vertex from './vertex';
 
 /** 历史层全部 mock 掉:这里要断的正是「什么时候记成功/失败」 */
 const h = vi.hoisted(() => ({
@@ -255,6 +256,45 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
     expect(seen).toEqual(['答案文本']); // validate 拿到的是提取后的正文
     expect(h.finishLlm).toHaveBeenCalledTimes(1);
     expect(h.failLlm).not.toHaveBeenCalled();
+  });
+
+  it('Vertex 是文字 tag 渠道，NAI 仍是出图后端', async () => {
+    const previous = {
+      tagGen: settings.assignments.tagGen,
+      backend: settings.defaultBackend,
+      flex: settings.vertex.flex,
+    };
+    const output = '{"images":[{"prompt":"blue eyes"}]}';
+    const send = vi.spyOn(vertex, 'vertexRequest').mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: output }] } }],
+    });
+    try {
+      settings.assignments.tagGen = VERTEX_TAG_CHANNEL_ID;
+      settings.defaultBackend = 'nai';
+      settings.vertex.flex = true;
+      const tagChannel = getTagGenChannel();
+      expect(tagChannel).not.toBeNull();
+      const validate = vi.fn();
+      await expect(requestCompletion(tagChannel!, messages, { validate })).resolves.toBe(output);
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'gemini-3.5-flash', flex: true }),
+        {
+          contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+          generationConfig: { maxOutputTokens: 16384 },
+        },
+        expect.any(AbortSignal),
+        600,
+      );
+      expect(validate).toHaveBeenCalledWith(output);
+      expect(h.finishLlm).toHaveBeenCalledTimes(1);
+      expect(settings.defaultBackend).toBe('nai');
+      expect(BACKENDS.map(backend => backend.value)).toEqual(['nai', 'comfyui', 'webui']);
+    } finally {
+      send.mockRestore();
+      settings.assignments.tagGen = previous.tagGen;
+      settings.defaultBackend = previous.backend;
+      settings.vertex.flex = previous.flex;
+    }
   });
 
   it('不传 validate → 维持旧行为:拿到文本即记成功', async () => {
