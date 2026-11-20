@@ -280,7 +280,7 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
       expect(send).toHaveBeenCalledWith(
         expect.objectContaining({ id: preset.id, model: 'gemini-3.5-flash', flex: true }),
         messages,
-        { maxTokens: 16384, signal: expect.any(AbortSignal), timeoutSec: 600 },
+        { maxTokens: 65535, signal: expect.any(AbortSignal), timeoutSec: 600, connectivityTest: false },
       );
       expect(validate).toHaveBeenCalledWith(output);
       expect(h.finishLlm).toHaveBeenCalledTimes(1);
@@ -314,6 +314,55 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
       expect(h.failLlm).toHaveBeenCalledWith(1, '连接失败', false);
     } finally {
       send.mockRestore();
+    }
+  });
+
+  it.each([false, true])('Vertex 正式请求交给宿主插件处理，测活原样放行（Flex=%s）', async flex => {
+    const channel = { ...newVertexChannel(), flex };
+    vi.stubGlobal('__TAURITAVERN__', {});
+    vi.stubGlobal('indexedDB', {
+      open: () => {
+        const request = {
+          onsuccess: () => {},
+          result: {
+            close: () => {},
+            transaction: () => {
+              const tx = {
+                oncomplete: () => {},
+                objectStore: () => ({ get: () => ({ result: { tauriSecretId: 'test-credential-id' } }) }),
+              };
+              queueMicrotask(() => tx.oncomplete());
+              return tx;
+            },
+          },
+        };
+        queueMicrotask(() => request.onsuccess());
+        return request;
+      },
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      expect(url).toBe('/api/backends/chat-completions/generate');
+      const body = JSON.parse(String(init?.body));
+      // 模拟宿主插件只处理未声明原样放行的请求。
+      const content = body.tool_choice === 'none' ? 'OK' : '处理后的 tag';
+      return jsonResponse({ ...okPayload, choices: [{ message: { content } }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await expect(requestCompletion(channel, messages)).resolves.toBe('处理后的 tag');
+      await expect(testChannel(channel)).resolves.toMatchObject({ ok: true, message: expect.stringContaining('OK') });
+      const [tagRequest, testRequest] = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+      expect(tagRequest).toMatchObject({ chat_completion_source: 'vertexai', type: 'quiet', messages, max_tokens: 65535 });
+      expect(tagRequest).not.toHaveProperty('tool_choice');
+      expect(tagRequest).not.toHaveProperty('custom_include_body');
+      if (flex) {
+        expect(JSON.parse(tagRequest.custom_include_headers)['X-Vertex-AI-LLM-Shared-Request-Type']).toBe('flex');
+      } else {
+        expect(tagRequest).not.toHaveProperty('custom_include_headers');
+      }
+      expect(testRequest.tool_choice).toBe('none');
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 

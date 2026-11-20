@@ -1103,7 +1103,8 @@ async function confirmUpdate() {
           </label>
           <label class="bbi-mini-field">
             <span>最大 token</span>
-            <input v-model.number="editingChannel.maxTokens" class="bbi-input" type="number" step="256" :min="vertexDraft ? 1 : 256" />
+            <input v-model.number="editingChannel.maxTokens" class="bbi-input" type="number"
+              :step="vertexDraft ? 1 : 256" :min="vertexDraft ? 1 : 256" />
           </label>
           <label class="bbi-mini-field">
             <span>超时(秒)</span>

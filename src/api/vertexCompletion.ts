@@ -10,7 +10,7 @@ export const DEFAULT_VERTEX_TEXT: VertexTextSettings = {
   location: 'global',
   model: 'gemini-3.5-flash',
   flex: false,
-  maxTokens: 16384,
+  maxTokens: 65535,
   timeoutSec: 0,
 };
 
@@ -26,12 +26,14 @@ interface GeminiResponse {
 export async function requestVertexCompletion(
   config: VertexTextSettings & Pick<VertexConnection, 'id'>,
   messages: ChatMsg[],
-  signal?: AbortSignal,
+  { signal, connectivityTest = false }: { signal?: AbortSignal; connectivityTest?: boolean } = {},
 ) {
   const maxTokens = Math.max(1, Math.floor(config.maxTokens || DEFAULT_VERTEX_TEXT.maxTokens));
   const timeout = vertexTimeoutSec(config.flex, config.timeoutSec);
   const result = await withVertexTimeout(timeout, signal,
-    activeSignal => vertexRequest<GeminiResponse>(config, messages, { maxTokens, signal: activeSignal, timeoutSec: timeout }));
+    activeSignal => vertexRequest<GeminiResponse>(config, messages, {
+      maxTokens, signal: activeSignal, timeoutSec: timeout, connectivityTest,
+    }));
   const candidate = result.candidates?.[0];
   const text = candidate?.content?.parts?.filter(part => !part.thought).map(part => part.text ?? '').join('').trim();
   if (!text) {

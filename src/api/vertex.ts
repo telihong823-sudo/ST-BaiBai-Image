@@ -266,7 +266,12 @@ async function accessToken(serviceAccount: ServiceAccount, signal: AbortSignal):
 export async function vertexRequest<T>(
   config: VertexConnection,
   messages: ChatMsg[],
-  { maxTokens, signal, timeoutSec }: { maxTokens: number; signal: AbortSignal; timeoutSec: number },
+  { maxTokens, signal, timeoutSec, connectivityTest }: {
+    maxTokens: number;
+    signal: AbortSignal;
+    timeoutSec: number;
+    connectivityTest: boolean;
+  },
 ): Promise<T> {
   const location = config.location.trim() || 'global';
   const model = config.model.trim();
@@ -288,7 +293,8 @@ export async function vertexRequest<T>(
       model,
       stream: false,
       type: 'quiet',
-      tool_choice: 'none',
+      // 部分插件用 tool_choice:none 识别需要原样放行的请求，只给连通性测试发送。
+      ...(connectivityTest && { tool_choice: 'none' }),
       messages,
       use_sysprompt: true,
       max_tokens: maxTokens,

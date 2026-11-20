@@ -163,8 +163,12 @@ export async function requestCompletion(
   return requestCompletionAtUrl(channel, messages, normalizeUrl(channel.url), opts);
 }
 
-function requestVertexChannel(channel: VertexTagChannel, messages: ChatMsg[], opts: RequestOptions) {
-  return trackCompletion(channel, false, messages, opts, () => requestVertexCompletion(channel, messages, opts.signal));
+function requestVertexChannel(
+  channel: VertexTagChannel,
+  messages: ChatMsg[],
+  opts: RequestOptions & { connectivityTest?: boolean },
+) {
+  return trackCompletion(channel, false, messages, opts, () => requestVertexCompletion(channel, messages, opts));
 }
 
 /**
@@ -496,7 +500,7 @@ export async function testChannel(channel: TagGenChannel, signal?: AbortSignal):
   const messages: ChatMsg[] = [{ role: 'user', content: '回复"ok"两个字符即可。' }];
   if ('provider' in channel) {
     try {
-      const reply = await requestVertexChannel(channel, messages, { source: '连通性测试', signal });
+      const reply = await requestVertexChannel(channel, messages, { source: '连通性测试', signal, connectivityTest: true });
       const tier = channel.flex ? ' · ' + describeFlexTraffic(reply.trafficType) : '';
       return { ok: true, message: '连通正常 · ' + reply.content.slice(0, 40) + tier };
     } catch (error) {
