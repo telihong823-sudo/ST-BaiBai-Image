@@ -366,6 +366,62 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
     }
   });
 
+  it('Vertex 优先通道发送官方 Priority PayGo 请求头并识别处理层', async () => {
+    const channel = { ...newVertexChannel(), location: 'us', priority: true };
+    vi.stubGlobal('__TAURITAVERN__', {});
+    vi.stubGlobal('indexedDB', {
+      open: () => {
+        const request = {
+          onsuccess: () => {},
+          result: {
+            close: () => {},
+            transaction: () => {
+              const tx = {
+                oncomplete: () => {},
+                objectStore: () => ({ get: () => ({ result: { tauriSecretId: 'test-priority-id' } }) }),
+              };
+              queueMicrotask(() => tx.oncomplete());
+              return tx;
+            },
+          },
+        };
+        queueMicrotask(() => request.onsuccess());
+        return request;
+      },
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      return jsonResponse({
+        ...okPayload,
+        choices: [{ message: { content: body.tool_choice === 'none' ? 'OK' : 'priority tag' } }],
+        usageMetadata: { trafficType: 'ON_DEMAND_PRIORITY', promptTokenCount: 10, candidatesTokenCount: 4 },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await expect(requestCompletion(channel, messages)).resolves.toBe('priority tag');
+      await expect(testChannel(channel)).resolves.toEqual({
+        ok: true,
+        message: '连通正常 · OK · 优先通道已确认',
+      });
+      const [tagRequest] = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+      expect(tagRequest.vertexai_region).toBe('us');
+      expect(JSON.parse(tagRequest.custom_include_headers)).toEqual({
+        'X-Vertex-AI-LLM-Request-Type': 'shared',
+        'X-Vertex-AI-LLM-Shared-Request-Type': 'priority',
+      });
+      expect(vertex.VERTEX_LOCATIONS.map(l => l.value)).toEqual(
+        expect.arrayContaining(['global', 'us', 'eu']),
+      );
+      expect(vertex.normalizeVertexConnection({ flex: true, priority: true }, channel)).toMatchObject({
+        flex: true,
+        priority: false,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('不传 validate → 维持旧行为:拿到文本即记成功', async () => {
     await expect(requestCompletion(channel, messages)).resolves.toBe('答案文本');
     expect(h.finishLlm).toHaveBeenCalledTimes(1);

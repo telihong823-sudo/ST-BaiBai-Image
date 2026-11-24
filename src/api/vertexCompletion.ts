@@ -10,6 +10,7 @@ export const DEFAULT_VERTEX_TEXT: VertexTextSettings = {
   location: 'global',
   model: 'gemini-3.5-flash',
   flex: false,
+  priority: false,
   maxTokens: 65535,
   timeoutSec: 0,
 };

@@ -6,8 +6,14 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import VertexCredentials from '@/components/VertexCredentials.vue';
-import { fetchModels, testChannel } from '@/api/client';
-import { clearVertexCredential, hasVertexCredential, VERTEX_MODELS } from '@/api/vertex';
+import { fetchModels, listStPresetNames, testChannel } from '@/api/client';
+import {
+  clearVertexCredential,
+  hasVertexCredential,
+  VERTEX_LOCATIONS,
+  VERTEX_MODELS,
+  vertexFlexError,
+} from '@/api/vertex';
 import {
   BACKENDS,
   DEFAULT_JAILBREAK_PROMPT,
@@ -23,8 +29,10 @@ import {
   type BackendId,
   type ImageDisplaySize,
   type TagGenChannel,
+  type TagGenMode,
 } from '@/state/settings';
 import { getContext } from '@/st/context';
+import { resolveTagGenSelection } from '@/autoTag/presetMode';
 import {
   ORB_SHAPES,
   THEMES,
@@ -47,12 +55,13 @@ const BACKEND_OPTIONS = BACKENDS.filter(b => b.value !== 'webui');
 
 /**
  * 思考强度候选:各家取值的并集,**不是**某一家的官方列表。
- * auto 是显式选项(值为空串 = 不发送该参数),不是「留空」——
+ * auto 是显式选项(值为空串 = 独立模式不发送该参数,预设模式沿用预设自身的值),不是「留空」——
  * 用 BbiSelect 而非可输入的 BbiCombo:移动端点输入框会弹出输入法,很打扰。
  * 取值不做校验,原样发给端点(见 ApiChannel.reasoningEffort)。
  */
 const REASONING_EFFORT_OPTIONS = [
   { value: '', label: 'auto' },
+  { value: 'none', label: 'none' },
   { value: 'minimal', label: 'minimal' },
   { value: 'low', label: 'low' },
   { value: 'medium', label: 'medium' },
@@ -97,6 +106,42 @@ const TAG_GEN_OPTIONS = computed(() => [
   { value: '', label: '跟随主 API' },
   ...allChannels.value.map(c => ({ value: c.id, label: c.name || '未命名渠道' })),
 ]);
+const tagGenModeSel = computed<string>({
+  get: () => settings.apiPresets.mainApi.mode,
+  set: v => {
+    const next = v as TagGenMode;
+    settings.apiPresets.mainApi.mode = next;
+    if (next !== 'named-preset') settings.apiPresets.mainApi.presetName = '';
+    if (next === 'named-preset') refreshStPresetNames();
+  },
+});
+const TAG_GEN_MODE_OPTIONS = [
+  { value: 'independent', label: '独立组装提示词' },
+  { value: 'current-preset', label: '使用 ST 当前预设' },
+  { value: 'named-preset', label: '使用指定预设' },
+];
+const stPresetNames = ref<string[]>([]);
+function refreshStPresetNames(): void {
+  stPresetNames.value = listStPresetNames();
+  const selection = resolveTagGenSelection();
+  if (selection.removedPreset) {
+    toastr.warning(`指定预设「${selection.removedPreset}」已不存在，已切换为独立组装模式`, '柏宝绘');
+  }
+}
+const tagGenPresetSel = computed<string>({
+  get: () => settings.apiPresets.mainApi.presetName,
+  set: v => (settings.apiPresets.mainApi.presetName = v),
+});
+function stPresetOptions(saved: string) {
+  const options = [
+    { value: '', label: stPresetNames.value.length ? '请选择 ST 预设' : '未读取到 ST 预设' },
+    ...stPresetNames.value.map(name => ({ value: name, label: name })),
+  ];
+  // 列表暂时读不到时仍显示已保存值;确认被删除时 resolveTagGenSelection 已回退并清空它。
+  if (saved && !stPresetNames.value.includes(saved)) options.push({ value: saved, label: saved });
+  return options;
+}
+const TAG_GEN_PRESET_OPTIONS = computed(() => stPresetOptions(settings.apiPresets.mainApi.presetName));
 
 /* —— 渠道:列表只读展示,编辑/新建都在弹窗里进行,避免一长列表平铺误触。
    渠道列表与柏宝书共享(见 state/settings.ts 的共享存储),任一端改动自动同步。 —— */
@@ -113,12 +158,48 @@ const openAiDraft = computed(() => {
   const channel = editingChannel.value;
   return channel && !('provider' in channel) ? channel : null;
 });
+const assignedIsVertex = computed(() =>
+  Boolean(settings.assignments.tagGen && settings.vertexChannels.some(c => c.id === settings.assignments.tagGen)),
+);
 const vertexCredentials = ref<InstanceType<typeof VertexCredentials> | null>(null);
 const credentialBusy = ref(false);
 const editorBusy = ref(false);
 const channelBusy = computed(() => credentialBusy.value || editorBusy.value);
 let testController: AbortController | null = null;
 const testRunning = ref(false);
+const vertexFlexWarning = computed(() => (vertexDraft.value ? vertexFlexError(vertexDraft.value) : ''));
+
+function setVertexPriority(checked: boolean) {
+  if (!vertexDraft.value) return;
+  vertexDraft.value.priority = checked;
+  if (checked) vertexDraft.value.flex = false;
+}
+function setVertexFlex(checked: boolean) {
+  if (!vertexDraft.value) return;
+  vertexDraft.value.flex = checked;
+  if (checked) vertexDraft.value.priority = false;
+}
+function isVertexModelFlex(id: string): boolean | undefined {
+  return VERTEX_MODELS.find(m => m.id === id)?.flex;
+}
+
+// 预设模式配置随独立共享存储(baibai_api_preset_settings)跨柏宝插件同步;这里只在「完成」时写回。
+const editingTagGenMode = ref<TagGenMode>('independent');
+const editingTagGenPreset = ref('');
+const editingTagGenModeSel = computed<string>({
+  get: () => editingTagGenMode.value,
+  set: v => {
+    const next = v as TagGenMode;
+    editingTagGenMode.value = next;
+    // 选中使用当前/指定预设时,把思考强度切到 auto(沿用所选预设的思考强度),
+    // 避免副渠道原先填的 high 等档位意外覆盖预设本身配置;用户之后仍可按需手动改。
+    if (next !== 'independent' && openAiDraft.value) {
+      openAiDraft.value.reasoningEffort = '';
+    }
+    if (next === 'named-preset') refreshStPresetNames();
+  },
+});
+const CHANNEL_TAG_GEN_PRESET_OPTIONS = computed(() => stPresetOptions(editingTagGenPreset.value));
 // 密钥默认隐藏;每次打开/关闭弹窗都复位,避免密钥意外保持明文
 const showKey = ref(false);
 
@@ -165,7 +246,7 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'jailbreak',
     label: '破限词',
-    hint: '作为置顶 system 附加在自动 tag 请求里，降低副 API 拒答率。留空则用内置默认（与柏宝书同款文本）。全后端通用。',
+    hint: '仅在独立组装模式下作为置顶 system 附加，降低拒答率；使用 ST 当前预设时由该预设自己的破限生效。留空则用内置默认（与柏宝书同款文本）。',
     builtin: DEFAULT_JAILBREAK_PROMPT,
     macros: [],
   },
@@ -239,13 +320,25 @@ function addChannel(provider: 'openai' | 'vertex' = 'openai') {
   showKey.value = false;
   editingId.value = null; // null = 新建,完成时 push
   editingChannel.value = provider === 'vertex' ? newVertexChannel() : newChannel();
+  editingTagGenMode.value = 'independent';
+  editingTagGenPreset.value = '';
 }
 function openChannel(id: string) {
   const src = allChannels.value.find(c => c.id === id);
   if (!src) return;
   showKey.value = false;
   editingId.value = id;
-  editingChannel.value = 'provider' in src ? { ...src } : { ...src, excludeParams: [...src.excludeParams] };
+  if ('provider' in src) {
+    editingChannel.value = { ...src };
+    editingTagGenMode.value = 'independent';
+    editingTagGenPreset.value = '';
+  } else {
+    editingChannel.value = { ...src, excludeParams: [...src.excludeParams] };
+    refreshStPresetNames();
+    const prefs = settings.apiPresets.channels[id];
+    editingTagGenMode.value = prefs?.mode ?? 'independent';
+    editingTagGenPreset.value = prefs?.presetName ?? '';
+  }
 }
 function resetChannelEditor() {
   testController?.abort();
@@ -299,6 +392,14 @@ async function confirmChannel() {
       const idx = settings.channels.findIndex(c => c.id === editingId.value);
       if (idx >= 0) settings.channels[idx] = draft;
       else settings.channels.push(draft);
+      if (editingTagGenMode.value === 'independent') {
+        delete settings.apiPresets.channels[draft.id];
+      } else {
+        settings.apiPresets.channels[draft.id] = {
+          mode: editingTagGenMode.value,
+          presetName: editingTagGenMode.value === 'named-preset' ? editingTagGenPreset.value : '',
+        };
+      }
     }
     resetChannelEditor();
   } finally {
@@ -322,29 +423,40 @@ async function confirmRemoveChannel() {
     if (vertexDraft.value) await clearVertexCredential(id);
     const idx = list.findIndex(c => c.id === id);
     if (idx >= 0) list.splice(idx, 1);
+    delete settings.apiPresets.channels[id];
     if (settings.assignments.tagGen === id) settings.assignments.tagGen = '';
     resetChannelEditor();
   } catch (error) {
     testing.value[id] = error instanceof Error ? error.message : String(error);
+    testingStatus.value[id] = 'error';
   } finally {
     editorBusy.value = false;
   }
 }
 
 const testing = ref<Record<string, string>>({});
+const testingStatus = ref<Record<string, 'running' | 'ok' | 'error'>>({});
 async function doTest(ch: TagGenChannel) {
   if (testRunning.value || channelBusy.value) return;
   const controller = new AbortController();
   testController = controller;
   testRunning.value = true;
   testing.value[ch.id] = '测试中…';
+  testingStatus.value[ch.id] = 'running';
   try {
     if ('provider' in ch && vertexCredentials.value && !await vertexCredentials.value.savePending()) {
       testing.value[ch.id] = '';
+      delete testingStatus.value[ch.id];
       return;
     }
     const r = await testChannel(ch, controller.signal);
-    testing.value[ch.id] = controller.signal.aborted ? '' : r.message;
+    if (controller.signal.aborted) {
+      testing.value[ch.id] = '';
+      delete testingStatus.value[ch.id];
+    } else {
+      testing.value[ch.id] = r.message;
+      testingStatus.value[ch.id] = r.ok ? 'ok' : 'error';
+    }
   } finally {
     testController = null;
     testRunning.value = false;
@@ -534,7 +646,10 @@ function closeModelMenuSoon() {
 }
 
 const updateConfirmOpen = ref(false);
-onMounted(() => void checkForUpdate(true));
+onMounted(() => {
+  refreshStPresetNames();
+  void checkForUpdate(true);
+});
 
 function openUpdateConfirm() {
   if (updateState.available) updateConfirmOpen.value = true;
@@ -703,14 +818,36 @@ async function confirmUpdate() {
 
       <!-- 副 API:生成画图 tag 用的模型渠道(与柏宝书共享渠道列表) -->
       <Collapsible title="副 API" :open="false">
-        <!-- 任务指派:只有一个任务——生成 tag -->
-        <div class="bbi-field bbi-assign">
-          <div class="bbi-assign-row">
-            <span class="bbi-field-label">生成 tag 使用</span>
-            <BbiSelect v-model="tagGenSel" :options="TAG_GEN_OPTIONS" aria-label="生成 tag 使用的 API 渠道" />
+        <div class="bbi-tag-gen-mode">
+          <div class="bbi-assign">
+            <div class="bbi-assign-row">
+              <span class="bbi-field-label">生成 tag 使用</span>
+              <BbiSelect v-model="tagGenSel" :options="TAG_GEN_OPTIONS" aria-label="生成 tag 使用的 API 渠道" />
+            </div>
           </div>
+          <!-- 主 API 的提示词方式跟在指派下面;副 API 则在各自编辑窗口独立设置。 -->
+          <template v-if="!settings.assignments.tagGen">
+            <div class="bbi-assign">
+              <div class="bbi-assign-row">
+                <span class="bbi-field-label">提示词方式</span>
+                <BbiSelect v-model="tagGenModeSel" :options="TAG_GEN_MODE_OPTIONS" aria-label="主 API 的 tag 提示词方式" />
+              </div>
+            </div>
+            <div v-if="settings.apiPresets.mainApi.mode === 'named-preset'" class="bbi-assign">
+              <div class="bbi-assign-row">
+                <span class="bbi-field-label">指定预设</span>
+                <BbiSelect v-model="tagGenPresetSel" :options="TAG_GEN_PRESET_OPTIONS" aria-label="主 API 生成 tag 使用的 ST 预设" />
+              </div>
+            </div>
+            <p v-if="settings.apiPresets.mainApi.mode === 'current-preset'" class="bbi-field-hint">使用当前预设进行生成tag</p>
+            <p v-else-if="settings.apiPresets.mainApi.mode === 'named-preset'" class="bbi-field-hint">使用指定预设进行生成tag</p>
+            <p v-else class="bbi-field-hint">由插件独立组装提示词</p>
+          </template>
+          <p v-else-if="assignedIsVertex" class="bbi-field-hint">
+            Vertex AI 渠道固定使用独立组装模式，可在下方渠道编辑窗口调整地区、优先通道与凭证。
+          </p>
+          <p v-else class="bbi-field-hint">提示词方式在所选渠道的编辑窗口中设置</p>
         </div>
-        <p class="bbi-field-hint">选择用于写 tag 的文字模型。</p>
 
         <hr class="bbi-rule" />
 
@@ -721,8 +858,8 @@ async function confirmUpdate() {
             <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addChannel()">
               <Icon name="plus" /> 添加渠道
             </button>
-            <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addChannel('vertex')">
-              <Icon name="plus" /> 添加 Vertex AI 渠道
+            <button class="bbi-btn bbi-btn-vertex bbi-btn-sm" type="button" @click="addChannel('vertex')">
+              <Icon name="sparkles" /> Vertex AI
             </button>
           </div>
         </div>
@@ -730,12 +867,22 @@ async function confirmUpdate() {
         <ul v-if="allChannels.length" class="bbi-channel-list">
           <li v-for="ch in allChannels" :key="ch.id" class="bbi-channel-item">
             <button class="bbi-channel-open" type="button" @click="openChannel(ch.id)">
-              <span class="bbi-channel-item-name">{{ ch.name || '未命名渠道' }}</span>
-              <span class="bbi-channel-item-model">{{ ch.model || '未设模型' }}</span>
+              <span class="bbi-channel-item-main">
+                <span class="bbi-channel-item-name">{{ ch.name || '未命名渠道' }}</span>
+                <span v-if="'provider' in ch" class="vx-chip vx-chip-provider">Vertex</span>
+              </span>
+              <span class="bbi-channel-item-meta">
+                <template v-if="'provider' in ch">
+                  <span class="vx-chip">{{ ch.location || 'global' }}</span>
+                  <span v-if="ch.priority" class="vx-chip vx-chip-priority">优先</span>
+                  <span v-else-if="ch.flex" class="vx-chip vx-chip-flex">Flex</span>
+                </template>
+                <span class="bbi-channel-item-model">{{ ch.model || '未设模型' }}</span>
+              </span>
             </button>
           </li>
         </ul>
-        <p v-else class="bbi-field-hint">还没有渠道。点「添加渠道」配置生成 tag 要用的 API。</p>
+        <p v-else class="bbi-field-hint">还没有渠道。点「添加渠道」或「Vertex AI」配置生成 tag 要用的 API。</p>
       </Collapsible>
 
       <Collapsible title="自动生成 tag" :open="false">
@@ -762,7 +909,7 @@ async function confirmUpdate() {
             @change="normalizeAutoTagNumbers"
           />
         </label>
-        <p class="bbi-field-hint">按 AI 故事楼计数,中间的 user 楼一并携带。</p>
+        <p class="bbi-field-hint">按 AI 故事楼计数,中间的 user 楼一并携带；两种生成方式共用此范围。</p>
 
         <label class="bbi-num-row">
           <span class="bbi-field-label">单楼最少图片数</span>
@@ -828,7 +975,7 @@ async function confirmUpdate() {
       <!-- 排除世界书内容:与柏宝书同名单共享 -->
       <Collapsible title="排除世界书内容" :open="false">
         <p class="bbi-field-hint">
-          从生成 tag 参考的世界书里剔除对画面无用的条目,省 token 也避免干扰。名单与柏宝书共享;仅影响副 API。
+          从生成 tag 参考的世界书里剔除对画面无用的条目,省 token 也避免干扰。名单与柏宝书共享；仅影响独立组装模式，当前预设模式由 ST 自己激活世界书。
         </p>
 
         <!-- 整本排除:复刻排除角色的搜索+勾选弹窗 -->
@@ -846,7 +993,7 @@ async function confirmUpdate() {
             </button>
           </li>
         </ul>
-        <p v-else class="bbi-field-hint">未排除任何世界书,全部激活条目都会进 tag 生成参考。</p>
+        <p v-else class="bbi-field-hint">未排除任何世界书；独立组装模式下，全部激活条目都会进 tag 生成参考。</p>
 
         <hr class="bbi-rule" />
 
@@ -1008,13 +1155,18 @@ async function confirmUpdate() {
     <ModalMask :open="!!editingChannel" @close="closeChannel">
       <div v-if="editingChannel" class="bbi-modal" role="dialog" aria-modal="true" aria-label="编辑渠道">
         <header class="bbi-modal-head">
-          <span class="bbi-modal-title">编辑渠道</span>
+          <div class="vx-modal-title-group">
+            <span class="bbi-modal-title">
+              {{ editingId ? '编辑' : '添加' }}{{ vertexDraft ? ' Vertex AI 渠道' : '渠道' }}
+            </span>
+            <span v-if="vertexDraft" class="vx-chip vx-chip-provider">Vertex AI</span>
+          </div>
           <button class="bbi-icon-mini" type="button" title="关闭" :disabled="channelBusy" @click="closeChannel"><Icon name="close" /></button>
         </header>
 
         <label class="bbi-modal-field">
           <span class="bbi-modal-label">渠道名</span>
-          <input v-model="editingChannel.name" class="bbi-input" placeholder="渠道名" />
+          <input v-model="editingChannel.name" class="bbi-input" :placeholder="vertexDraft ? '如 Vertex AI · 赠金' : '渠道名'" />
         </label>
         <VertexCredentials
           v-if="vertexDraft"
@@ -1072,79 +1224,203 @@ async function confirmUpdate() {
                   :class="{ 'is-active': m === editingChannel.model }"
                   @mousedown.prevent="pickModel(m)"
                 >
-                  {{ m }}
+                  <span class="bbi-combo-item-text">{{ m }}</span>
+                  <span v-if="vertexDraft && isVertexModelFlex(m)" class="vx-chip vx-chip-flex">Flex</span>
                 </li>
               </ul>
             </div>
             <button
+              v-if="openAiDraft"
               class="bbi-icon-mini"
               type="button"
               :title="loadingModels[editingChannel.id] ? '拉取中…' : '拉取模型'"
-              v-if="openAiDraft"
               :disabled="loadingModels[editingChannel.id]"
               @click="pullModels(openAiDraft)"
             >
               <Icon name="refresh" />
             </button>
-            <button v-else class="bbi-icon-mini" type="button" title="选择模型" aria-label="选择模型"
-              :aria-expanded="modelMenuOpen" @mousedown.prevent @click="modelMenuOpen ? (modelMenuOpen = false) : openModelMenu()">
-              <Icon name="chevron" />
-            </button>
           </div>
         </label>
-        <div class="bbi-channel-row">
-          <label v-if="openAiDraft" class="bbi-mini-field">
-            <span>温度</span>
-            <input v-model.number="openAiDraft.temperature" class="bbi-input" type="number" step="0.1" min="0" max="2" />
-          </label>
-          <label v-if="vertexDraft" class="bbi-mini-field">
-            <span>地区</span>
-            <input v-model.trim="vertexDraft.location" class="bbi-input" placeholder="global" />
-          </label>
-          <label class="bbi-mini-field">
-            <span>最大 token</span>
-            <input v-model.number="editingChannel.maxTokens" class="bbi-input" type="number"
-              :step="vertexDraft ? 1 : 256" :min="vertexDraft ? 1 : 256" />
-          </label>
-          <label class="bbi-mini-field">
-            <span>超时(秒)</span>
-            <input v-model.number="editingChannel.timeoutSec" class="bbi-input" type="number" step="10"
-              :min="vertexDraft ? 0 : 1" :max="vertexDraft?.flex ? 1800 : undefined" />
-          </label>
-          <!-- 思考强度用 BbiSelect(纯选择,不唤起输入法);它自带 180px 固定宽,
-               这里要跟其余三个等分,故在 .bbi-mini-field 内用 :deep 放开宽度 -->
-          <div v-if="openAiDraft" class="bbi-mini-field">
-            <span>思考强度</span>
-            <BbiSelect
-              v-model="openAiDraft.reasoningEffort"
-              :options="REASONING_EFFORT_OPTIONS"
-              aria-label="思考强度"
+
+        <!-- Vertex AI 专属：地区快捷切换 + 参数 + 通道模式卡片 -->
+        <template v-if="vertexDraft">
+          <div class="bbi-modal-field vx-location-field">
+            <span class="bbi-modal-label">地区（Location）</span>
+            <div class="vx-loc-pills" role="group" aria-label="常用地区快捷选择">
+              <button
+                v-for="loc in VERTEX_LOCATIONS"
+                :key="loc.value"
+                type="button"
+                class="vx-loc-pill"
+                :class="{ 'is-on': (vertexDraft.location.trim() || 'global') === loc.value }"
+                @click="vertexDraft.location = loc.value"
+              >
+                <span class="vx-loc-code">{{ loc.label }}</span>
+                <span class="vx-loc-note">{{ loc.note }}</span>
+              </button>
+            </div>
+            <input
+              v-model.trim="vertexDraft.location"
+              class="bbi-input vx-loc-input"
+              placeholder="常用 global / us / eu，或输入自定义地区如 asia-northeast1"
+              spellcheck="false"
             />
           </div>
-        </div>
-        <template v-if="vertexDraft">
-          <span class="bbi-field-hint">超时填 0 时，标准模式 180 秒，Flex 模式 600 秒。</span>
+
+          <div class="bbi-channel-row is-vertex">
+            <label class="bbi-mini-field">
+              <span>最大 token</span>
+              <input v-model.number="vertexDraft.maxTokens" class="bbi-input" type="number" step="1" min="1" />
+            </label>
+            <label class="bbi-mini-field">
+              <span>超时(秒)</span>
+              <input
+                v-model.number="vertexDraft.timeoutSec"
+                class="bbi-input"
+                type="number"
+                step="10"
+                min="0"
+                :max="vertexDraft.flex ? 1800 : undefined"
+              />
+            </label>
+          </div>
+          <p class="bbi-field-hint vx-compact-hint">超时填 0 使用默认（标准 / 优先通道 180 秒，Flex 600 秒）。</p>
+
+          <div class="vx-tier-card">
+            <label class="vx-tier-row">
+              <span class="vx-tier-info">
+                <span class="vx-tier-title-line">
+                  <span class="vx-tier-name">优先通道（Priority PayGo）</span>
+                  <span class="vx-chip vx-chip-priority">1.8× 计费 · 降 429</span>
+                </span>
+                <span class="vx-tier-desc">
+                  附带 <code>X-Vertex-AI-LLM-Shared-Request-Type: priority</code>，高峰期优先排队、减少 429/PVP；无优先容量时自动回落标准 1×。
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                class="bbi-checkbox"
+                :checked="vertexDraft.priority"
+                @change="setVertexPriority(($event.target as HTMLInputElement).checked)"
+              />
+            </label>
+
+            <hr class="vx-tier-divider" />
+
+            <label class="vx-tier-row">
+              <span class="vx-tier-info">
+                <span class="vx-tier-title-line">
+                  <span class="vx-tier-name">Flex 模式（Flex PayGo）</span>
+                  <span class="vx-chip vx-chip-flex">折扣 · 仅 global</span>
+                </span>
+                <span class="vx-tier-desc">
+                  低成本弹性队列，仅支持 <code>global</code> 地区与部分模型，响应延迟较高。
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                class="bbi-checkbox"
+                :checked="vertexDraft.flex"
+                @change="setVertexFlex(($event.target as HTMLInputElement).checked)"
+              />
+            </label>
+
+            <div v-if="vertexFlexWarning" class="vx-tier-warn" role="alert">
+              <span>{{ vertexFlexWarning }}</span>
+              <button
+                v-if="(vertexDraft.location.trim() || 'global') !== 'global'"
+                type="button"
+                class="vx-warn-btn"
+                @click="vertexDraft.location = 'global'"
+              >
+                切到 global
+              </button>
+            </div>
+          </div>
+        </template>
+
+        <!-- OpenAI 兼容渠道专属参数 -->
+        <template v-if="openAiDraft">
+          <div class="bbi-channel-row">
+            <label class="bbi-mini-field">
+              <span>温度</span>
+              <input v-model.number="openAiDraft.temperature" class="bbi-input" type="number" step="0.1" min="0" max="2" />
+            </label>
+            <label class="bbi-mini-field">
+              <span>最大 token</span>
+              <input v-model.number="openAiDraft.maxTokens" class="bbi-input" type="number" step="256" min="256" />
+            </label>
+            <label class="bbi-mini-field">
+              <span>超时(秒)</span>
+              <input v-model.number="openAiDraft.timeoutSec" class="bbi-input" type="number" step="10" min="1" />
+            </label>
+            <!-- 思考强度用 BbiSelect(纯选择,不唤起输入法);它自带 180px 固定宽,
+                 这里要跟其余三个等分,故在 .bbi-mini-field 内用 :deep 放开宽度 -->
+            <div class="bbi-mini-field">
+              <span>思考强度</span>
+              <BbiSelect
+                v-model="openAiDraft.reasoningEffort"
+                :options="REASONING_EFFORT_OPTIONS"
+                aria-label="思考强度"
+              />
+            </div>
+          </div>
+          <span class="bbi-field-hint">
+            {{
+              editingTagGenMode === 'independent'
+                ? '思考强度不知道的就选 auto，关思考选 none，DS 系推荐 max'
+                : '预设模式下选 auto 将沿用所选预设里的思考强度；也可手动指定 none / low / high 等覆盖'
+            }}
+          </span>
           <label class="bbi-switch-row">
-            <span class="bbi-modal-label">Flex 模式（global）</span>
-            <input v-model="vertexDraft.flex" type="checkbox" class="bbi-checkbox" />
+            <span class="bbi-modal-label">流式传输</span>
+            <input v-model="openAiDraft.stream" type="checkbox" class="bbi-checkbox" />
+          </label>
+
+          <div class="bbi-tag-gen-mode">
+            <div class="bbi-assign">
+              <div class="bbi-assign-row">
+                <span class="bbi-field-label">tag 提示词方式</span>
+                <BbiSelect v-model="editingTagGenModeSel" :options="TAG_GEN_MODE_OPTIONS" aria-label="此渠道的 tag 提示词方式" />
+              </div>
+            </div>
+            <div v-if="editingTagGenMode === 'named-preset'" class="bbi-assign">
+              <div class="bbi-assign-row">
+                <span class="bbi-field-label">指定预设</span>
+                <BbiSelect
+                  v-model="editingTagGenPreset"
+                  :options="CHANNEL_TAG_GEN_PRESET_OPTIONS"
+                  aria-label="此渠道生成 tag 使用的 ST 预设"
+                />
+              </div>
+            </div>
+            <p v-if="editingTagGenMode === 'current-preset'" class="bbi-field-hint">使用当前预设进行生成tag</p>
+            <p v-else-if="editingTagGenMode === 'named-preset'" class="bbi-field-hint">使用指定预设进行生成tag</p>
+            <p v-else class="bbi-field-hint">由插件独立组装提示词</p>
+          </div>
+
+          <label class="bbi-modal-field">
+            <span class="bbi-modal-label">排除参数</span>
+            <input
+              v-model="excludeParamsText"
+              class="bbi-input"
+              type="text"
+              placeholder="逗号分隔,如 temperature, max_tokens"
+            />
+            <span class="bbi-field-hint">这些参数会在发请求前从请求体里删除,用于规避不接受该参数的兼容端点报错。逗号分隔,留空则不排除。</span>
           </label>
         </template>
-        <span v-if="openAiDraft" class="bbi-field-hint">思考强度不知道的就选 auto，DS 系推荐 max</span>
-        <label v-if="openAiDraft" class="bbi-switch-row">
-          <span class="bbi-modal-label">流式传输</span>
-          <input v-model="openAiDraft.stream" type="checkbox" class="bbi-checkbox" />
-        </label>
-        <label v-if="openAiDraft" class="bbi-modal-field">
-          <span class="bbi-modal-label">排除参数</span>
-          <input
-            v-model="excludeParamsText"
-            class="bbi-input"
-            type="text"
-            placeholder="逗号分隔,如 temperature, max_tokens"
-          />
-          <span class="bbi-field-hint">这些参数会在发请求前从请求体里删除,用于规避不接受该参数的兼容端点报错。逗号分隔,留空则不排除。</span>
-        </label>
-        <p v-if="testing[editingChannel.id]" class="bbi-channel-test">{{ testing[editingChannel.id] }}</p>
+
+        <p
+          v-if="testing[editingChannel.id]"
+          class="bbi-channel-test"
+          :class="{
+            'is-ok': testingStatus[editingChannel.id] === 'ok',
+            'is-error': testingStatus[editingChannel.id] === 'error',
+          }"
+        >
+          {{ testing[editingChannel.id] }}
+        </p>
 
         <footer class="bbi-modal-foot">
           <!-- 删除靠左、与右侧主操作拉开,破坏性动作不与「完成」相邻,降低误触。
@@ -1347,6 +1623,17 @@ async function confirmUpdate() {
 
 /* ============ 副 API:渠道(与柏宝书同款) ============ */
 
+/* tag 生成方式 + 可选预设 + 一行说明是同一组,不叠通用 bbi-field 的 18px 间距。 */
+.bbi-tag-gen-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+.bbi-tag-gen-mode .bbi-field-hint {
+  margin: 0;
+}
+
 /* 任务指派 */
 .bbi-assign {
   display: flex;
@@ -1385,6 +1672,16 @@ async function confirmUpdate() {
   gap: 8px;
 }
 
+.bbi-btn-vertex {
+  color: var(--bbi-accent);
+  border-color: var(--bbi-accent);
+  background: var(--bbi-accent-soft);
+}
+.bbi-btn-vertex:hover {
+  background: var(--bbi-accent);
+  color: var(--bbi-accent-ink);
+}
+
 /* 渠道:紧凑只读列表,每渠道一行,点行进弹窗编辑 */
 .bbi-channel-list {
   list-style: none;
@@ -1421,13 +1718,29 @@ async function confirmUpdate() {
   border-color: var(--bbi-accent);
   background: var(--bbi-surface);
 }
+.bbi-channel-item-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
 /* 渠道名:完整显示,允许换行,占据剩余空间 */
 .bbi-channel-item-name {
-  flex: 1 1 auto;
   min-width: 0;
   font-size: 14px;
   font-weight: 600;
   word-break: break-word;
+}
+.bbi-channel-item-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 /* 模型名:次要信息,过长则截断,不挤占名字 */
 .bbi-channel-item-model {
@@ -1439,6 +1752,173 @@ async function confirmUpdate() {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* —— Vertex AI 专属徽标 / 地区快捷条 / 通道卡片 —— */
+.vx-modal-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.vx-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--bbi-radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--bbi-ink-soft);
+  background: var(--bbi-surface);
+  border: 1px solid var(--bbi-line);
+}
+.vx-chip-provider {
+  color: var(--bbi-accent);
+  background: var(--bbi-accent-soft);
+  border-color: transparent;
+}
+.vx-chip-priority {
+  color: var(--bbi-warning);
+  background: var(--bbi-warning-soft);
+  border-color: transparent;
+}
+.vx-chip-flex {
+  color: var(--bbi-ink-soft);
+  background: var(--bbi-surface-2);
+  border-color: var(--bbi-line);
+}
+.vx-location-field {
+  gap: 6px;
+}
+.vx-loc-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.vx-loc-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--bbi-line-strong);
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-surface);
+  color: var(--bbi-ink-soft);
+  font-family: var(--bbi-font-sans);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    color var(--bbi-dur) var(--bbi-ease),
+    border-color var(--bbi-dur) var(--bbi-ease),
+    background var(--bbi-dur) var(--bbi-ease);
+}
+.vx-loc-pill:hover {
+  border-color: var(--bbi-accent);
+  color: var(--bbi-ink);
+}
+.vx-loc-pill.is-on {
+  border-color: var(--bbi-accent);
+  background: var(--bbi-accent-soft);
+  color: var(--bbi-accent);
+  font-weight: 600;
+}
+.vx-loc-code {
+  font-family: var(--bbi-font-mono);
+  font-size: 11.5px;
+}
+.vx-loc-note {
+  font-size: 11px;
+  opacity: 0.78;
+}
+.vx-loc-input {
+  font-family: var(--bbi-font-mono);
+  font-size: 12.5px;
+}
+.vx-compact-hint {
+  margin: -6px 0 0;
+}
+.vx-tier-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius);
+  background: var(--bbi-surface-2);
+}
+.vx-tier-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+}
+.vx-tier-row .bbi-checkbox {
+  margin-top: 2px;
+}
+.vx-tier-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.vx-tier-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.vx-tier-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bbi-ink);
+}
+.vx-tier-desc {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--bbi-ink-muted);
+}
+.vx-tier-desc code {
+  font-family: var(--bbi-font-mono);
+  font-size: 11px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--bbi-surface);
+  color: var(--bbi-ink-soft);
+}
+.vx-tier-divider {
+  height: 1px;
+  margin: 0;
+  border: 0;
+  background: var(--bbi-line);
+}
+.vx-tier-warn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-warning-soft);
+  color: var(--bbi-warning);
+  font-size: 12px;
+}
+.vx-warn-btn {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  border: 1px solid currentColor;
+  border-radius: var(--bbi-radius-pill);
+  background: transparent;
+  color: inherit;
+  font-family: var(--bbi-font-sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.vx-warn-btn:hover {
+  background: var(--bbi-surface);
 }
 
 /* —— 渠道编辑弹窗 —— */
@@ -1519,12 +1999,19 @@ async function confirmUpdate() {
   box-shadow: var(--bbi-shadow);
 }
 .bbi-combo-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 7px 9px;
   border-radius: var(--bbi-radius-sm);
   font-size: 12.5px;
   color: var(--bbi-ink);
   cursor: pointer;
   word-break: break-all;
+}
+.bbi-combo-item-text {
+  min-width: 0;
 }
 .bbi-combo-item:hover {
   background: var(--bbi-surface-2);
@@ -1545,6 +2032,9 @@ async function confirmUpdate() {
   grid-template-columns: repeat(4, 1fr);
   gap: 10px;
 }
+.bbi-channel-row.is-vertex {
+  grid-template-columns: repeat(2, 1fr);
+}
 .bbi-mini-field {
   flex: 1;
   min-width: 0;
@@ -1563,10 +2053,25 @@ async function confirmUpdate() {
   padding: 7px 10px;
 }
 .bbi-channel-test {
-  margin: 2px 0 0;
+  margin: 0;
+  padding: 8px 11px;
+  border-radius: var(--bbi-radius-sm);
+  border: 1px solid var(--bbi-line);
+  background: var(--bbi-surface-2);
   font-size: 12px;
+  line-height: 1.5;
   color: var(--bbi-ink-soft);
-  word-break: break-all;
+  word-break: break-word;
+}
+.bbi-channel-test.is-ok {
+  border-color: transparent;
+  background: var(--bbi-accent-soft);
+  color: var(--bbi-accent);
+}
+.bbi-channel-test.is-error {
+  border-color: transparent;
+  background: var(--bbi-danger-soft);
+  color: var(--bbi-danger);
 }
 
 /* 弹窗底部:spacer 把删除键推到最左,与右侧操作分隔 */

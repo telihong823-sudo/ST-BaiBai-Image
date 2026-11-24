@@ -1,6 +1,6 @@
 {
   "name": "st-baibai-image",
-  "version": "0.3.6+vertex5",
+  "version": "0.3.7+vertex1",
   "private": true,
   "type": "module",
   "scripts": {

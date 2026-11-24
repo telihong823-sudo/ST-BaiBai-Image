@@ -7,7 +7,16 @@ export interface VertexConnection {
   location: string;
   model: string;
   flex: boolean;
+  priority: boolean;
 }
+
+export const VERTEX_LOCATIONS = [
+  { value: 'global', label: 'global', note: '全球' },
+  { value: 'us', label: 'us', note: '美国多区' },
+  { value: 'eu', label: 'eu', note: '欧洲多区' },
+  { value: 'us-central1', label: 'us-central1', note: '美中' },
+  { value: 'europe-west4', label: 'europe-west4', note: '荷兰' },
+] as const;
 
 interface ServiceAccount {
   project: string;
@@ -47,6 +56,11 @@ function credentialKey(channelId: string): string {
 
 export function hasVertexCredential(channelId: string): boolean {
   return Boolean(accounts.get(credentialKey(channelId)));
+}
+
+export function getVertexCredentialInfo(channelId: string): { project: string; email: string } | null {
+  const account = accounts.get(credentialKey(channelId));
+  return account ? { project: account.project, email: account.email } : null;
 }
 
 function isTauriTavern(): boolean {
@@ -199,10 +213,13 @@ export function normalizeVertexConnection(
   value: Partial<Omit<VertexConnection, 'id'>> | undefined,
   defaults: Omit<VertexConnection, 'id'>,
 ): Omit<VertexConnection, 'id'> {
+  const flex = value?.flex === true;
+  const priority = !flex && value?.priority === true;
   return {
     location: typeof value?.location === 'string' ? value.location : defaults.location,
     model: typeof value?.model === 'string' ? value.model : defaults.model,
-    flex: value?.flex === true,
+    flex,
+    priority,
   };
 }
 
@@ -210,6 +227,26 @@ export function vertexTimeoutSec(flex: boolean, requested?: number): number {
   const custom = typeof requested === 'number' && Number.isFinite(requested) && requested >= 1
     ? Math.floor(requested) : undefined;
   return flex ? Math.min(custom ?? 600, 1800) : custom ?? 180;
+}
+
+export function vertexTierHeaders(
+  config: Pick<VertexConnection, 'flex' | 'priority'>,
+  timeoutSec: number,
+): Record<string, string> | undefined {
+  if (config.flex) {
+    return {
+      'X-Vertex-AI-LLM-Request-Type': 'shared',
+      'X-Vertex-AI-LLM-Shared-Request-Type': 'flex',
+      'X-Server-Timeout': String(timeoutSec),
+    };
+  }
+  if (config.priority) {
+    return {
+      'X-Vertex-AI-LLM-Request-Type': 'shared',
+      'X-Vertex-AI-LLM-Shared-Request-Type': 'priority',
+    };
+  }
+  return undefined;
 }
 
 export function vertexFlexError(config: VertexConnection): string {
@@ -222,6 +259,19 @@ export function vertexFlexError(config: VertexConnection): string {
 export function describeFlexTraffic(traffic?: string): string {
   if (traffic === 'ON_DEMAND_FLEX') return 'Flex 已确认';
   return traffic ? '实际处理层 ' + traffic : '已请求 Flex，TauriTavern 未返回实际处理层';
+}
+
+export function describeTrafficTier(
+  config: Pick<VertexConnection, 'flex' | 'priority'>,
+  traffic?: string,
+): string {
+  if (config.flex) return describeFlexTraffic(traffic);
+  if (config.priority) {
+    if (traffic === 'ON_DEMAND_PRIORITY') return '优先通道已确认';
+    if (traffic === 'ON_DEMAND') return '已回落标准层（ON_DEMAND）';
+    return traffic ? '实际处理层 ' + traffic : '已发送优先请求头（宿主未返回处理层）';
+  }
+  return '';
 }
 
 function base64Url(value: Uint8Array): string {
@@ -282,6 +332,7 @@ export async function vertexRequest<T>(
   await loadVertexCredential(config.id);
   const serviceAccount = accounts.get(credentialKey(config.id));
   if (!serviceAccount) throw new Error('请先导入 Vertex AI 服务账号 JSON 凭证');
+  const tierHeaders = vertexTierHeaders(config, timeoutSec);
   if (isTauriTavern()) {
     if (!serviceAccount.tauriSecretId) throw new Error('请在 TauriTavern 内重新导入此渠道的服务账号凭证');
     // 通过宿主发送真实的 messages，宿主和拦截插件才能保留对这些消息的修改。
@@ -298,12 +349,8 @@ export async function vertexRequest<T>(
       messages,
       use_sysprompt: true,
       max_tokens: maxTokens,
-      ...(config.flex && {
-        custom_include_headers: JSON.stringify({
-          'X-Vertex-AI-LLM-Request-Type': 'shared',
-          'X-Vertex-AI-LLM-Shared-Request-Type': 'flex',
-          'X-Server-Timeout': String(timeoutSec),
-        }),
+      ...(tierHeaders && {
+        custom_include_headers: JSON.stringify(tierHeaders),
       }),
     }, signal);
     const message = completion.choices?.[0]?.message;
@@ -334,7 +381,11 @@ export async function vertexRequest<T>(
     method: 'POST',
     credentials: 'omit',
     redirect: 'error',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'Content-Type': 'application/json',
+      ...tierHeaders,
+    },
     body: JSON.stringify({
       ...(system.length && { systemInstruction: { parts: system } }),
       contents,
