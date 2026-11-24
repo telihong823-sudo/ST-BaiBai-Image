@@ -158,9 +158,6 @@ const openAiDraft = computed(() => {
   const channel = editingChannel.value;
   return channel && !('provider' in channel) ? channel : null;
 });
-const assignedIsVertex = computed(() =>
-  Boolean(settings.assignments.tagGen && settings.vertexChannels.some(c => c.id === settings.assignments.tagGen)),
-);
 const vertexCredentials = ref<InstanceType<typeof VertexCredentials> | null>(null);
 const credentialBusy = ref(false);
 const editorBusy = ref(false);
@@ -183,6 +180,13 @@ function isVertexModelFlex(id: string): boolean | undefined {
   return VERTEX_MODELS.find(m => m.id === id)?.flex;
 }
 
+const vertexReasoningEffort = computed<string>({
+  get: () => vertexDraft.value?.reasoningEffort ?? '',
+  set: v => {
+    if (vertexDraft.value) vertexDraft.value.reasoningEffort = v;
+  },
+});
+
 // 预设模式配置随独立共享存储(baibai_api_preset_settings)跨柏宝插件同步;这里只在「完成」时写回。
 const editingTagGenMode = ref<TagGenMode>('independent');
 const editingTagGenPreset = ref('');
@@ -193,8 +197,8 @@ const editingTagGenModeSel = computed<string>({
     editingTagGenMode.value = next;
     // 选中使用当前/指定预设时,把思考强度切到 auto(沿用所选预设的思考强度),
     // 避免副渠道原先填的 high 等档位意外覆盖预设本身配置;用户之后仍可按需手动改。
-    if (next !== 'independent' && openAiDraft.value) {
-      openAiDraft.value.reasoningEffort = '';
+    if (next !== 'independent' && editingChannel.value) {
+      editingChannel.value.reasoningEffort = '';
     }
     if (next === 'named-preset') refreshStPresetNames();
   },
@@ -328,17 +332,13 @@ function openChannel(id: string) {
   if (!src) return;
   showKey.value = false;
   editingId.value = id;
-  if ('provider' in src) {
-    editingChannel.value = { ...src };
-    editingTagGenMode.value = 'independent';
-    editingTagGenPreset.value = '';
-  } else {
-    editingChannel.value = { ...src, excludeParams: [...src.excludeParams] };
-    refreshStPresetNames();
-    const prefs = settings.apiPresets.channels[id];
-    editingTagGenMode.value = prefs?.mode ?? 'independent';
-    editingTagGenPreset.value = prefs?.presetName ?? '';
-  }
+  editingChannel.value = 'provider' in src
+    ? { ...src, reasoningEffort: src.reasoningEffort ?? '' }
+    : { ...src, excludeParams: [...src.excludeParams] };
+  refreshStPresetNames();
+  const prefs = settings.apiPresets.channels[id];
+  editingTagGenMode.value = prefs?.mode ?? 'independent';
+  editingTagGenPreset.value = prefs?.presetName ?? '';
 }
 function resetChannelEditor() {
   testController?.abort();
@@ -392,14 +392,14 @@ async function confirmChannel() {
       const idx = settings.channels.findIndex(c => c.id === editingId.value);
       if (idx >= 0) settings.channels[idx] = draft;
       else settings.channels.push(draft);
-      if (editingTagGenMode.value === 'independent') {
-        delete settings.apiPresets.channels[draft.id];
-      } else {
-        settings.apiPresets.channels[draft.id] = {
-          mode: editingTagGenMode.value,
-          presetName: editingTagGenMode.value === 'named-preset' ? editingTagGenPreset.value : '',
-        };
-      }
+    }
+    if (editingTagGenMode.value === 'independent') {
+      delete settings.apiPresets.channels[draft.id];
+    } else {
+      settings.apiPresets.channels[draft.id] = {
+        mode: editingTagGenMode.value,
+        presetName: editingTagGenMode.value === 'named-preset' ? editingTagGenPreset.value : '',
+      };
     }
     resetChannelEditor();
   } finally {
@@ -843,9 +843,6 @@ async function confirmUpdate() {
             <p v-else-if="settings.apiPresets.mainApi.mode === 'named-preset'" class="bbi-field-hint">使用指定预设进行生成tag</p>
             <p v-else class="bbi-field-hint">由插件独立组装提示词</p>
           </template>
-          <p v-else-if="assignedIsVertex" class="bbi-field-hint">
-            Vertex AI 渠道固定使用独立组装模式，可在下方渠道编辑窗口调整地区、优先通道与凭证。
-          </p>
           <p v-else class="bbi-field-hint">提示词方式在所选渠道的编辑窗口中设置</p>
         </div>
 
@@ -1283,8 +1280,44 @@ async function confirmUpdate() {
                 :max="vertexDraft.flex ? 1800 : undefined"
               />
             </label>
+            <div class="bbi-mini-field">
+              <span>思考强度</span>
+              <BbiSelect
+                v-model="vertexReasoningEffort"
+                :options="REASONING_EFFORT_OPTIONS"
+                aria-label="思考强度"
+              />
+            </div>
           </div>
-          <p class="bbi-field-hint vx-compact-hint">超时填 0 使用默认（标准 / 优先通道 180 秒，Flex 600 秒）。</p>
+          <p class="bbi-field-hint vx-compact-hint">
+            超时填 0 使用默认（标准 / 优先 180 秒，Flex 600 秒）；{{
+              editingTagGenMode === 'independent'
+                ? '思考强度不知道就选 auto，关思考选 none / minimal。'
+                : '预设模式下选 auto 将沿用所选预设里的思考强度，也可手动覆盖。'
+            }}
+          </p>
+
+          <div class="bbi-tag-gen-mode vx-preset-mode">
+            <div class="bbi-assign">
+              <div class="bbi-assign-row">
+                <span class="bbi-field-label">tag 提示词方式</span>
+                <BbiSelect v-model="editingTagGenModeSel" :options="TAG_GEN_MODE_OPTIONS" aria-label="此渠道的 tag 提示词方式" />
+              </div>
+            </div>
+            <div v-if="editingTagGenMode === 'named-preset'" class="bbi-assign">
+              <div class="bbi-assign-row">
+                <span class="bbi-field-label">指定预设</span>
+                <BbiSelect
+                  v-model="editingTagGenPreset"
+                  :options="CHANNEL_TAG_GEN_PRESET_OPTIONS"
+                  aria-label="此渠道生成 tag 使用的 ST 预设"
+                />
+              </div>
+            </div>
+            <p v-if="editingTagGenMode === 'current-preset'" class="bbi-field-hint">使用当前预设进行生成tag</p>
+            <p v-else-if="editingTagGenMode === 'named-preset'" class="bbi-field-hint">使用指定预设进行生成tag</p>
+            <p v-else class="bbi-field-hint">由插件独立组装提示词</p>
+          </div>
 
           <div class="vx-tier-card">
             <label class="vx-tier-row">
@@ -2033,7 +2066,10 @@ async function confirmUpdate() {
   gap: 10px;
 }
 .bbi-channel-row.is-vertex {
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
+}
+.vx-preset-mode {
+  margin-bottom: 0;
 }
 .bbi-mini-field {
   flex: 1;

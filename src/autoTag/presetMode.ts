@@ -14,9 +14,6 @@ export interface TagGenSelection {
  */
 export function resolveTagGenSelection(): TagGenSelection {
   const channelId = settings.assignments.tagGen;
-  if (channelId && settings.vertexChannels?.some(c => c.id === channelId)) {
-    return { mode: 'independent', removedPreset: '' };
-  }
   const prefs = channelId ? settings.apiPresets.channels[channelId] : settings.apiPresets.mainApi;
   const mode = prefs?.mode ?? 'independent';
   if (mode !== 'named-preset') return { mode, removedPreset: '' };

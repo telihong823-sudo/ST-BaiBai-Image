@@ -408,7 +408,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
           : retries > 0
             ? `自动 tag(第 ${floor} 楼 · 第 ${attempt + 1} 次)`
             : `自动 tag(第 ${floor} 楼)`;
-        if (usePreset && (!channel || !('provider' in channel))) {
+        if (usePreset) {
           await requestViaPreset(messages, {
             signal: controller.signal,
             source,

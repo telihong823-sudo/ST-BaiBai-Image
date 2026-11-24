@@ -8,14 +8,13 @@ export interface VertexConnection {
   model: string;
   flex: boolean;
   priority: boolean;
+  reasoningEffort?: string;
 }
 
 export const VERTEX_LOCATIONS = [
   { value: 'global', label: 'global', note: '全球' },
   { value: 'us', label: 'us', note: '美国多区' },
   { value: 'eu', label: 'eu', note: '欧洲多区' },
-  { value: 'us-central1', label: 'us-central1', note: '美中' },
-  { value: 'europe-west4', label: 'europe-west4', note: '荷兰' },
 ] as const;
 
 interface ServiceAccount {
@@ -220,7 +219,39 @@ export function normalizeVertexConnection(
     model: typeof value?.model === 'string' ? value.model : defaults.model,
     flex,
     priority,
+    reasoningEffort: typeof value?.reasoningEffort === 'string' ? value.reasoningEffort : (defaults.reasoningEffort ?? ''),
   };
+}
+
+function buildDirectThinkingConfig(model: string, rawEffort: string): Record<string, unknown> | undefined {
+  const effort = rawEffort.trim().toLowerCase();
+  if (!effort || effort === 'auto') return undefined;
+  if (/^gemini-2\.5-/i.test(model)) {
+    const budgetMap: Record<string, number> = {
+      none: 0,
+      min: 0,
+      minimal: 0,
+      low: 1024,
+      medium: 8192,
+      high: 24576,
+      xhigh: 24576,
+      max: 24576,
+    };
+    const budget = budgetMap[effort];
+    return budget !== undefined ? { thinkingBudget: budget } : undefined;
+  }
+  const levelMap: Record<string, string> = {
+    none: 'MINIMAL',
+    min: 'MINIMAL',
+    minimal: 'MINIMAL',
+    low: 'LOW',
+    medium: 'MEDIUM',
+    high: 'HIGH',
+    xhigh: 'XHIGH',
+    max: 'XHIGH',
+  };
+  const level = levelMap[effort];
+  return level ? { thinkingLevel: level } : undefined;
 }
 
 export function vertexTimeoutSec(flex: boolean, requested?: number): number {
@@ -333,6 +364,7 @@ export async function vertexRequest<T>(
   const serviceAccount = accounts.get(credentialKey(config.id));
   if (!serviceAccount) throw new Error('请先导入 Vertex AI 服务账号 JSON 凭证');
   const tierHeaders = vertexTierHeaders(config, timeoutSec);
+  const effort = config.reasoningEffort?.trim() ?? '';
   if (isTauriTavern()) {
     if (!serviceAccount.tauriSecretId) throw new Error('请在 TauriTavern 内重新导入此渠道的服务账号凭证');
     // 通过宿主发送真实的 messages，宿主和拦截插件才能保留对这些消息的修改。
@@ -349,11 +381,16 @@ export async function vertexRequest<T>(
       messages,
       use_sysprompt: true,
       max_tokens: maxTokens,
+      ...(effort && { reasoning_effort: effort }),
       ...(tierHeaders && {
         custom_include_headers: JSON.stringify(tierHeaders),
       }),
     }, signal);
     const message = completion.choices?.[0]?.message;
+    // TauriTavern 在上游 429/错误时有时以 HTTP 200 返回 "[API 错误] ..." 正文，需按失败抛出以便重试和正确提示。
+    if (typeof message?.content === 'string' && /^\s*\[API\s*错误\]/i.test(message.content)) {
+      throw new Error(message.content.trim().slice(0, 400));
+    }
     const content = typeof message?.content === 'string' && message.content.trim()
       ? { parts: [{ text: message.content }] }
       : completion.responseContent ?? message?.native?.gemini?.content;
@@ -377,6 +414,7 @@ export async function vertexRequest<T>(
     role: message.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: message.content }],
   }));
+  const thinkingConfig = buildDirectThinkingConfig(model, effort);
   const response = await fetch(url, {
     method: 'POST',
     credentials: 'omit',
@@ -389,7 +427,10 @@ export async function vertexRequest<T>(
     body: JSON.stringify({
       ...(system.length && { systemInstruction: { parts: system } }),
       contents,
-      generationConfig: { maxOutputTokens: maxTokens },
+      generationConfig: {
+        maxOutputTokens: maxTokens,
+        ...(thinkingConfig && { thinkingConfig }),
+      },
     }),
     signal,
   });

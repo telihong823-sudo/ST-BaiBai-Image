@@ -11,6 +11,7 @@ export const DEFAULT_VERTEX_TEXT: VertexTextSettings = {
   model: 'gemini-3.5-flash',
   flex: false,
   priority: false,
+  reasoningEffort: '',
   maxTokens: 65535,
   timeoutSec: 0,
 };

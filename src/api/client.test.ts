@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BACKENDS, getTagGenChannel, newVertexChannel, settings, type ApiChannel } from '@/state/settings';
-import { buildRequestBody, extractContent, readSseContent, requestCompletion, testChannel } from './client';
+import { buildRequestBody, extractContent, readSseContent, requestCompletion, requestViaPreset, testChannel } from './client';
 import * as vertex from './vertex';
 
 /** 历史层全部 mock 掉:这里要断的正是「什么时候记成功/失败」 */
@@ -366,8 +366,8 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
     }
   });
 
-  it('Vertex 优先通道发送官方 Priority PayGo 请求头并识别处理层', async () => {
-    const channel = { ...newVertexChannel(), location: 'us', priority: true };
+  it('Vertex 优先通道发送官方 Priority PayGo 请求头、思考强度并拦截 [API 错误] 200 响应', async () => {
+    const channel = { ...newVertexChannel(), location: 'us', priority: true, reasoningEffort: 'high' };
     vi.stubGlobal('__TAURITAVERN__', {});
     vi.stubGlobal('indexedDB', {
       open: () => {
@@ -389,14 +389,20 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
         return request;
       },
     });
-    const fetchMock = vi.fn<typeof fetch>(async (_url, init) => {
-      const body = JSON.parse(String(init?.body));
-      return jsonResponse({
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
         ...okPayload,
-        choices: [{ message: { content: body.tool_choice === 'none' ? 'OK' : 'priority tag' } }],
+        choices: [{ message: { content: 'priority tag' } }],
         usageMetadata: { trafficType: 'ON_DEMAND_PRIORITY', promptTokenCount: 10, candidatesTokenCount: 4 },
-      });
-    });
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        ...okPayload,
+        choices: [{ message: { content: 'OK' } }],
+        usageMetadata: { trafficType: 'ON_DEMAND_PRIORITY', promptTokenCount: 10, candidatesTokenCount: 4 },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        choices: [{ message: { content: '[API 错误]\nGoogle Vertex AI endpoint failed with status 429: Resource exhausted.' } }],
+      }));
     vi.stubGlobal('fetch', fetchMock);
     try {
       await expect(requestCompletion(channel, messages)).resolves.toBe('priority tag');
@@ -404,20 +410,71 @@ describe('validate:历史「成功」= 调用方验收通过', () => {
         ok: true,
         message: '连通正常 · OK · 优先通道已确认',
       });
+      await expect(testChannel(channel)).resolves.toEqual({
+        ok: false,
+        message: expect.stringContaining('429'),
+      });
       const [tagRequest] = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
       expect(tagRequest.vertexai_region).toBe('us');
+      expect(tagRequest.reasoning_effort).toBe('high');
       expect(JSON.parse(tagRequest.custom_include_headers)).toEqual({
         'X-Vertex-AI-LLM-Request-Type': 'shared',
         'X-Vertex-AI-LLM-Shared-Request-Type': 'priority',
       });
-      expect(vertex.VERTEX_LOCATIONS.map(l => l.value)).toEqual(
-        expect.arrayContaining(['global', 'us', 'eu']),
-      );
+      expect(vertex.VERTEX_LOCATIONS.map(l => l.value)).toEqual(['global', 'us', 'eu']);
       expect(vertex.normalizeVertexConnection({ flex: true, priority: true }, channel)).toMatchObject({
         flex: true,
         priority: false,
       });
     } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('Vertex 渠道支持 ST 预设模式（通过酒馆助手组装提示词并改走 Vertex 通道）', async () => {
+    const presetChannel = { ...newVertexChannel(), name: 'Vertex 预设', location: 'global', reasoningEffort: '' };
+    const send = vi.spyOn(vertex, 'vertexRequest').mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: '{"images":[]}' }] } }],
+      usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 15 },
+    });
+    vi.stubGlobal('TavernHelper', {
+      getLoadedPresetName: () => '测试预设',
+      getPreset: () => ({ settings: { reasoning_effort: 'medium' } }),
+      generate: async (config: { user_input: string }) => {
+        const resp = await fetch('/api/backends/chat-completions/generate', {
+          method: 'POST',
+          body: JSON.stringify({
+            messages: [
+              { role: 'system', content: '预设破限系统词' },
+              { role: 'user', content: `${config.user_input}\n剧情正文` },
+            ],
+          }),
+        });
+        const data = await resp.json();
+        return { content: data.choices[0].message.content };
+      },
+    });
+    try {
+      const out = await requestViaPreset([{ role: 'user', content: '任务' }], {
+        channel: presetChannel,
+        source: '自动 tag',
+      });
+      expect(out).toBe('{"images":[]}');
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({ id: presetChannel.id, reasoningEffort: 'medium' }),
+        [
+          { role: 'system', content: '预设破限系统词' },
+          { role: 'user', content: '剧情正文' },
+        ],
+        expect.objectContaining({ maxTokens: 65535 }),
+      );
+      expect(h.finishLlm).toHaveBeenCalledWith(1, expect.objectContaining({
+        response: '{"images":[]}',
+        promptTokens: 120,
+        completionTokens: 15,
+      }));
+    } finally {
+      send.mockRestore();
       vi.unstubAllGlobals();
     }
   });

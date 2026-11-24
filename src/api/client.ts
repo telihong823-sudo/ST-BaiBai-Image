@@ -64,6 +64,8 @@ interface PendingRawApiResponse {
   wiScanMarker: string;
   wiScanEndMarker: string;
   onMessages?: (messages: ChatMsg[]) => void;
+  vertexRoute?: (messages: ChatMsg[]) => Promise<Response>;
+  vertexHandled?: boolean;
 }
 
 /**
@@ -100,6 +102,7 @@ function registerRawApiCapture(
     wiScanMarker: string;
     wiScanEndMarker: string;
     onMessages?: (messages: ChatMsg[]) => void;
+    vertexRoute?: (messages: ChatMsg[]) => Promise<Response>;
   },
 ): void {
   pendingRawApiResponses.set(generationId, {
@@ -109,6 +112,7 @@ function registerRawApiCapture(
     wiScanMarker: options.wiScanMarker,
     wiScanEndMarker: options.wiScanEndMarker,
     onMessages: options.onMessages,
+    vertexRoute: options.vertexRoute,
   });
   if (rawCaptureFetch) return;
   const original = globalThis.fetch;
@@ -117,8 +121,10 @@ function registerRawApiCapture(
     const body = init?.body;
     let pending: PendingRawApiResponse | undefined;
     let nextInit = init;
+    let capturedMessages: ChatMsg[] | null = null;
     if (typeof body === 'string' && isGenerateRequestUrl(input)) {
       for (const [id, candidate] of pendingRawApiResponses) {
+        if (candidate.vertexHandled) continue;
         if (
           body.includes(id) ||
           body.includes(candidate.requestMarker) ||
@@ -142,13 +148,19 @@ function registerRawApiCapture(
         if (cleanedBody !== body) {
           nextInit = { ...init, body: cleanedBody };
         }
-        if (pending.onMessages) {
-          const captured = extractMessagesFromFetchBody(cleanedBody, markers);
-          if (captured) pending.onMessages(captured);
+        if (pending.onMessages || pending.vertexRoute) {
+          capturedMessages = extractMessagesFromFetchBody(cleanedBody, markers);
+          if (capturedMessages && pending.onMessages) pending.onMessages(capturedMessages);
         }
       }
     }
-    const response = await original.call(globalThis, input, nextInit);
+    let response: Response;
+    if (pending?.vertexRoute && capturedMessages?.length) {
+      pending.vertexHandled = true;
+      response = await pending.vertexRoute(capturedMessages);
+    } else {
+      response = await original.call(globalThis, input, nextInit);
+    }
     if (pending) {
       const cloned = response.clone();
       pending.read = readClonedRawApiPayload(cloned)
@@ -974,7 +986,7 @@ export async function requestViaPreset(
   promptOrMessages: string | ChatMsg[],
   opts: RequestOptions & {
     presetName?: string;
-    channel?: ApiChannel;
+    channel?: TagGenChannel;
     worldInfoScanPrompts?: ChatMsg[];
   } = {},
 ): Promise<string> {
@@ -986,24 +998,35 @@ export async function requestViaPreset(
   const selectedPreset = opts.presetName?.trim() || 'in_use';
   if (namedPreset && selectedPreset === 'in_use') throw new ApiError('请先选择要用于生成 tag 的 ST 预设');
   const channel = opts.channel;
-  if (channel && (!channel.url || !channel.model)) {
+  const vertexChannel = channel && 'provider' in channel ? channel : null;
+  const openAiChannel = channel && !('provider' in channel) ? channel : null;
+  if (openAiChannel && (!openAiChannel.url || !openAiChannel.model)) {
     throw new ApiError('副 API 渠道未配置完整(缺 url 或 model)');
   }
 
   const context = getContext();
   const customApi: Record<string, unknown> = { max_tokens: channel?.maxTokens ?? MAIN_API_RESPONSE_LENGTH };
-  if (channel) {
-    const excludes = new Set((channel.excludeParams ?? []).map(value => value.trim()).filter(Boolean));
+  const vertexEffectiveEffort = vertexChannel
+    ? (vertexChannel.reasoningEffort?.trim() || readPresetReasoningEffort(helper, selectedPreset, context))
+    : '';
+  if (vertexChannel) {
+    // 借 TH 完整组装预设与世界书;真正发给 /generate 的请求会被 rawCaptureFetch 拦截并改走 Vertex 通道。
+    customApi.source = 'openai';
+    customApi.apiurl = 'https://vertex.local/v1';
+    customApi.key = 'vertex-channel';
+    customApi.model = vertexChannel.model;
+  } else if (openAiChannel) {
+    const excludes = new Set((openAiChannel.excludeParams ?? []).map(value => value.trim()).filter(Boolean));
     // 副渠道在预设模式下:
     // - 渠道自身填了具体思考强度(如 none/low/high/max) → 用渠道值覆盖;
     // - 渠道思考强度为 auto(空串) → 自动沿用所选 ST 预设里的 reasoning_effort(预设也是 auto 则不发)。
     const effectiveEffort =
-      channel.reasoningEffort?.trim() || readPresetReasoningEffort(helper, selectedPreset, context);
-    customApi.apiurl = normalizeUrl(channel.url);
-    customApi.key = channel.key || '';
+      openAiChannel.reasoningEffort?.trim() || readPresetReasoningEffort(helper, selectedPreset, context);
+    customApi.apiurl = normalizeUrl(openAiChannel.url);
+    customApi.key = openAiChannel.key || '';
     customApi.source = effectiveEffort && !excludes.has('reasoning_effort') ? 'custom' : 'openai';
-    if (!excludes.has('model')) customApi.model = channel.model;
-    if (!excludes.has('temperature')) customApi.temperature = channel.temperature ?? 1;
+    if (!excludes.has('model')) customApi.model = openAiChannel.model;
+    if (!excludes.has('temperature')) customApi.temperature = openAiChannel.temperature ?? 1;
     // TH 从预设构造请求;排除标准参数必须显式 unset,只省略会继续沿用预设里的值。
     for (const key of ['temperature', 'max_tokens', 'frequency_penalty', 'presence_penalty', 'top_p', 'top_k']) {
       if (excludes.has(key)) customApi[key] = 'unset';
@@ -1031,15 +1054,16 @@ export async function requestViaPreset(
       // 名称只是历史展示;旧版 TH 或查询失败不影响生成。
     }
   }
-  // 预设模式的流式开关:有指派副渠道时严格遵从渠道设置里的 stream 勾选;
-  // 跟随主 API 时沿用当前聊天补全预设的 stream_openai 开关。
-  const shouldStream = channel
-    ? Boolean(channel.stream)
-    : Boolean(context?.chatCompletionSettings?.stream_openai);
+  // 预设模式的流式开关:Vertex 走非流式;OpenAI 副渠道严格遵从渠道设置;跟随主 API 沿用当前预设开关。
+  const shouldStream = vertexChannel
+    ? false
+    : openAiChannel
+      ? Boolean(openAiChannel.stream)
+      : Boolean(context?.chatCompletionSettings?.stream_openai);
   const historyId = safeHistory(() =>
     beginLlm({
       source: opts.source || '未标注',
-      channelName: presetName,
+      channelName: vertexChannel ? `${vertexChannel.name || 'Vertex AI'} · ${presetName}` : presetName,
       model: channel?.model ?? '',
       stream: shouldStream,
       messages: tailMessages,
@@ -1051,10 +1075,10 @@ export async function requestViaPreset(
   };
   const eventSource = context?.eventSource as RemovableEventSource | undefined;
   const generationAfterCommandsEvent =
-    context?.eventTypes.GENERATION_AFTER_COMMANDS ?? 'generation_after_commands';
-  const promptReadyEvent = context?.eventTypes.CHAT_COMPLETION_PROMPT_READY ?? 'chat_completion_prompt_ready';
-  const afterDataEvent = context?.eventTypes.GENERATE_AFTER_DATA ?? 'generate_after_data';
-  const settingsReadyEvent = context?.eventTypes.CHAT_COMPLETION_SETTINGS_READY ?? 'chat_completion_settings_ready';
+    context?.eventTypes?.GENERATION_AFTER_COMMANDS ?? 'generation_after_commands';
+  const promptReadyEvent = context?.eventTypes?.CHAT_COMPLETION_PROMPT_READY ?? 'chat_completion_prompt_ready';
+  const afterDataEvent = context?.eventTypes?.GENERATE_AFTER_DATA ?? 'generate_after_data';
+  const settingsReadyEvent = context?.eventTypes?.CHAT_COMPLETION_SETTINGS_READY ?? 'chat_completion_settings_ready';
   const markers = [requestMarker, wiScanMarker, wiScanEndMarker];
   const recordActualMessages = (messages: ChatMsg[]) => {
     if (historyId === null || !messages.length) return;
@@ -1153,6 +1177,8 @@ export async function requestViaPreset(
 
   let rawResult: unknown;
   let rawApiResult: unknown;
+  let vertexError: unknown = null;
+  let vertexUsage: { prompt: number | null; completion: number | null } | null = null;
   try {
     if (opts.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     opts.signal?.addEventListener('abort', onAbort, { once: true });
@@ -1171,6 +1197,34 @@ export async function requestViaPreset(
         capturedFromSettingsOrFetch = true;
         recordActualMessages(messages);
       },
+      vertexRoute: vertexChannel
+        ? async assembledMessages => {
+            try {
+              const reply = await requestVertexCompletion(
+                { ...vertexChannel, reasoningEffort: vertexEffectiveEffort },
+                assembledMessages,
+                { signal: opts.signal },
+              );
+              vertexUsage = reply.usage;
+              return new Response(
+                JSON.stringify({
+                  choices: [{ message: { role: 'assistant', content: reply.content }, finish_reason: 'stop' }],
+                  usage: {
+                    ...(reply.usage.prompt !== null ? { prompt_tokens: reply.usage.prompt } : {}),
+                    ...(reply.usage.completion !== null ? { completion_tokens: reply.usage.completion } : {}),
+                  },
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              );
+            } catch (err) {
+              vertexError = err;
+              return new Response(
+                JSON.stringify({ error: { message: err instanceof Error ? err.message : String(err) } }),
+                { status: 500, headers: { 'content-type': 'application/json' } },
+              );
+            }
+          }
+        : undefined,
     });
     const result = await helper.generate({
       generation_id: generationId,
@@ -1189,6 +1243,7 @@ export async function requestViaPreset(
     });
     rawResult = result;
     rawApiResult = await readRawApiResponse(generationId);
+    if (vertexError) throw vertexError;
     if (opts.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     // 与独立请求的 extractContent 同口径:正文优先,正文空才回退 reasoning,绝不把两者混拼。
     const content = extractPresetResultContent(result);
@@ -1201,28 +1256,29 @@ export async function requestViaPreset(
       safeHistory(() =>
         finishLlm(historyId, {
           response: content,
-          promptTokens: null,
-          completionTokens: null,
+          promptTokens: vertexUsage?.prompt ?? null,
+          completionTokens: vertexUsage?.completion ?? null,
           tokensEstimated: false,
         }),
       );
     }
     return content;
   } catch (e) {
+    const err = vertexError ?? e;
     // TH 若在响应到达后的清理/提取阶段抛错,这里仍能等到已克隆的原始响应。
     rawApiResult ??= await readRawApiResponse(generationId);
     if (historyId !== null) {
-      const aborted = opts.signal?.aborted || (e instanceof DOMException && e.name === 'AbortError');
+      const aborted = opts.signal?.aborted || (err instanceof DOMException && err.name === 'AbortError');
       safeHistory(() =>
         failLlm(
           historyId,
-          e instanceof Error ? e.message : String(e),
+          err instanceof Error ? err.message : String(err),
           aborted,
           formatRawPresetResult(rawApiResult !== undefined ? rawApiResult : rawResult),
         ),
       );
     }
-    throw e;
+    throw err;
   } finally {
     restoreAssemblyGuards();
     unregisterRawApiCapture(generationId);

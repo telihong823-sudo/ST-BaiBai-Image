@@ -2668,7 +2668,7 @@ function hydrateSharedApiPresets(): void {
     sharedApiPresetsFingerprint = apiPresetsFingerprint(settings.apiPresets);
     if (apiPresetsHasUserData(settings.apiPresets)) writeSharedApiPresets(false);
   }
-  const validChannelIds = new Set(settings.channels.map(channel => channel.id));
+  const validChannelIds = new Set([...settings.channels, ...settings.vertexChannels].map(channel => channel.id));
   for (const id of Object.keys(settings.apiPresets.channels)) {
     if (!validChannelIds.has(id)) delete settings.apiPresets.channels[id];
   }
